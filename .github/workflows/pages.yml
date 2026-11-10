@@ -58,8 +58,9 @@ jobs:
           echo "$digest  build/levels/$name" | sha256sum --check
           echo "SCENE=build/levels/$name" >> "$GITHUB_ENV"
 
+      # In parts: Pages will not deploy one file of several hundred megabytes.
       - name: Build the site
-        run: bash tools/build-web.sh "$SCENE"
+        run: bash tools/build-web.sh --split "$SCENE"
 
       - uses: actions/upload-pages-artifact@v3
         with:

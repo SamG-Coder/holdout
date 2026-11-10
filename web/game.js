@@ -21,20 +21,53 @@ function progress(share, text) {
   if (text) el("loading-text").textContent = text;
 }
 
-/// Reads parts of the scene file by HTTP Range. A server that doesn't do ranges sends the whole
-/// file once, and the parts are then cut from memory.
+/// Reads parts of the scene by HTTP Range. The scene is one file or, where a host will not
+/// take a file so large, that file cut into equal parts with a note beside it
+/// (`NAME.parts.json`: the whole size, the size of a part, how many). A server that doesn't do
+/// ranges sends a whole file once, and what is asked of it is then cut from memory.
 class SceneFile {
-  #whole = null;
   #url;
+  #parts = null;
+  #wholes = new Map();
 
-  constructor(url) {
-    this.#url = url;
+  static async open(url) {
+    const file = new SceneFile();
+    file.#url = url;
+    try {
+      const note = await fetch(`${url}.parts.json`);
+      if (note.ok) file.#parts = await note.json();
+    } catch {
+      // No note: the scene is one file.
+    }
+    return file;
   }
 
   async read(start, end) {
-    if (this.#whole) return this.#whole.subarray(start, end);
-    const response = await fetch(this.#url, { headers: { Range: `bytes=${start}-${end - 1}` } });
-    if (!response.ok) throw new Error(`Could not load ${this.#url} (HTTP ${response.status}).`);
+    if (!this.#parts) return this.#readFrom(this.#url, start, end);
+    const size = this.#parts.part;
+    const first = Math.floor(start / size);
+    const last = Math.floor((end - 1) / size);
+    const name = (index) => `${this.#url}.${String(index).padStart(3, "0")}`;
+    if (first === last) return this.#readFrom(name(first), start - first * size, end - first * size);
+    // Across the join of two parts or more: read from each, and put them end to end.
+    const pieces = await Promise.all(Array.from({ length: last - first + 1 }, (_, i) => {
+      const index = first + i;
+      return this.#readFrom(name(index), Math.max(start - index * size, 0), Math.min(end - index * size, size));
+    }));
+    const out = new Uint8Array(end - start);
+    let offset = 0;
+    for (const piece of pieces) {
+      out.set(piece, offset);
+      offset += piece.length;
+    }
+    return out;
+  }
+
+  async #readFrom(url, start, end) {
+    const whole = this.#wholes.get(url);
+    if (whole) return whole.subarray(start, end);
+    const response = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` } });
+    if (!response.ok) throw new Error(`Could not load ${url} (HTTP ${response.status}).`);
     if (response.status === 200) {
       const total = Number(response.headers.get("content-length")) || 0;
       const reader = response.body.getReader();
@@ -47,13 +80,14 @@ class SceneFile {
         received += value.length;
         if (total) progress(0.05 + 0.5 * received / total, `Downloading Alder Ridge… ${(received / 1e6).toFixed(0)} MB`);
       }
-      this.#whole = new Uint8Array(received);
+      const all = new Uint8Array(received);
       let offset = 0;
       for (const chunk of chunks) {
-        this.#whole.set(chunk, offset);
+        all.set(chunk, offset);
         offset += chunk.length;
       }
-      return this.#whole.subarray(start, end);
+      this.#wholes.set(url, all);
+      return all.subarray(start, end);
     }
     return new Uint8Array(await response.arrayBuffer());
   }
@@ -310,7 +344,7 @@ async function main() {
   await init();
 
   progress(0.05, "Reading Alder Ridge…");
-  const file = new SceneFile(sceneUrl);
+  const file = await SceneFile.open(sceneUrl);
   const [manifestOffset, manifestBytes] = read_header(await file.read(0, header_bytes()));
   const manifest = await inflate(await file.read(manifestOffset, manifestOffset + manifestBytes));
 

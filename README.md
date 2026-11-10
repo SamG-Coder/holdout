@@ -129,11 +129,13 @@ The level needs Blender and a good many minutes to build, so CI does not build i
    release's tag and the file's SHA-256 into [`scene.txt`](scene.txt).
 2. Pushing to `main` runs [the Pages workflow](.github/workflows/pages.yml). It fetches the
    engine at the commit [`engine.txt`](engine.txt) names, compiles the game to WebAssembly,
-   downloads the scene `scene.txt` names, checks its hash, and deploys both to
-   **GitHub Pages**.
+   downloads the scene `scene.txt` names, checks its hash, cuts it into 64 MiB parts, and
+   deploys the lot to **GitHub Pages**.
 
 The scene is served from the same site as the game, because the game reads it by HTTP Range
-and release downloads cannot be fetched across origins.
+and release downloads cannot be fetched across origins. It is served in parts because Pages
+will not deploy a single file of several hundred megabytes; the page reads across the parts
+as it would the one file (`tools/build-web.sh --split`).
 
 ## Building it yourself
 
