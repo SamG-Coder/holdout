@@ -1,0 +1,86 @@
+diff --git a/crates/solstice-render/src/renderer.rs b/crates/solstice-render/src/renderer.rs
+index e6c8dfa..96b6bac 100644
+--- a/crates/solstice-render/src/renderer.rs
++++ b/crates/solstice-render/src/renderer.rs
+@@ -120,6 +120,10 @@ pub struct RendererSettings {
+     /// of this many steps through the GI volume.
+     pub particle_light_interval: u32,
+     pub particle_ray_steps: u32,
++    /// Tilts the view about its own forward axis, in radians, positive leaning the horizon
++    /// anticlockwise: for a head that leans, recoils or is shaken. The camera's own yaw and
++    /// pitch can't say this.
++    pub camera_roll: f32,
+ }
+ 
+ impl Default for RendererSettings {
+@@ -140,6 +144,7 @@ impl Default for RendererSettings {
+             particle_detail: 1.0,
+             particle_light_interval: 1,
+             particle_ray_steps: 16,
++            camera_roll: 0.0,
+         }
+     }
+ }
+@@ -319,6 +324,8 @@ pub struct Renderer {
+     time: f32,
+     /// Seconds since the previous frame.
+     frame_seconds: f32,
++    /// Lights changed since the last frame, to upload with the next.
++    pending_lights: Vec<(u32, solstice_asset::Light)>,
+ }
+ 
+ impl Renderer {
+@@ -497,6 +504,24 @@ impl Renderer {
+         self.scene.instance_table.transform(instance)
+     }
+ 
++    /// How many local lights the scene has. Lights are named by their index in the scene file.
++    pub fn light_count(&self) -> u32 {
++        self.scene.light_count
++    }
++
++    /// Changes one of the scene's local lights from the next frame on: where it is, how far it
++    /// reaches and how bright it is. Its shadow map is traced afresh every frame, and the GI
++    /// volume relights itself over a few frames, so a light can be moved or switched freely: a
++    /// muzzle flash is a light made bright for a frame or two. Returns false for a light the
++    /// scene doesn't have: lights can't be added, only changed.
++    pub fn set_light(&mut self, index: u32, light: solstice_asset::Light) -> bool {
++        if index >= self.scene.light_count {
++            return false;
++        }
++        self.pending_lights.push((index, light));
++        true
++    }
++
+     /// How many poses the scene can hold at once: one for each placed character.
+     pub fn pose_count(&self) -> u32 {
+         self.scene.skins.pose_count()
+@@ -664,6 +689,7 @@ impl Renderer {
+             sized: None,
+             history: None,
+             frame_index: 0,
++            pending_lights: Vec::new(),
+             time: 0.0,
+             frame_seconds: 1.0 / 60.0,
+         }
+@@ -824,6 +850,11 @@ impl Renderer {
+             ((output_size.0 as f32 * scale) as u32).max(16),
+             ((output_size.1 as f32 * scale) as u32).max(16),
+         );
++        for (index, light) in self.pending_lights.drain(..) {
++            let offset = u64::from(index) * std::mem::size_of::<solstice_asset::Light>() as u64;
++            gpu.queue
++                .write_buffer(&self.scene.lights, offset, bytemuck::bytes_of(&light));
++        }
+         // The sea first: whether there is one decides what the frame's textures are.
+         if let Some((ocean, seconds)) = self.ocean_request.take() {
+             match (ocean, &mut self.sea) {
+@@ -1349,7 +1380,7 @@ impl Renderer {
+     ) {
+         let viewport = Vec2::new(size.0 as f32, size.1 as f32);
+         let projection = camera.projection(viewport.x / viewport.y);
+-        let view = camera.view();
++        let view = Mat4::from_rotation_z(self.settings.camera_roll) * camera.view();
+         let unjittered = projection * view;
+ 
+         let jitter_ndc = jitter_offset(self.frame_index) * 2.0 / viewport;

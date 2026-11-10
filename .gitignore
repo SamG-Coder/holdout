@@ -1,0 +1,15 @@
+# Everything generated: compiled code, kits, textures, levels, the built site.
+/target/
+/build/
+/dist/
+
+# The Solstice engine is fetched by tools/setup-engine.sh at the commit engine.txt names.
+/engine/
+
+# Pictures taken while working; the README's are in docs/media.
+/progress/
+
+__pycache__/
+*.pyc
+*.blend1
+.claude/settings.local.json

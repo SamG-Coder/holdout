@@ -1,0 +1,5 @@
+# The same toolchain the engine pins, so its crates build exactly as they do there.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

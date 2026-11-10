@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HOLDOUT</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="view"></canvas>
+
+<!-- The interface drawn over the picture while playing. -->
+<div id="hud" hidden>
+  <div id="vignette"></div>
+  <div id="hurt-arc"></div>
+
+  <div id="compass"><div id="compass-strip"></div><div id="compass-tick"></div></div>
+
+  <div id="objective"><span class="diamond"></span><span id="objective-text"></span></div>
+
+  <div id="crosshair">
+    <i class="up"></i><i class="down"></i><i class="left"></i><i class="right"></i><i class="dot"></i>
+  </div>
+  <div id="hit-marker"><i></i><i></i><i></i><i></i></div>
+
+  <div id="goal" hidden><span class="diamond"></span><span id="goal-distance"></span></div>
+  <div id="friends"></div>
+
+  <div id="prompt" hidden>
+    <svg viewBox="0 0 44 44"><circle class="track" cx="22" cy="22" r="19"/><circle id="prompt-ring" cx="22" cy="22" r="19"/></svg>
+    <span class="key">E</span><span id="prompt-text"></span>
+  </div>
+
+  <div id="location">
+    <div class="place">ALDER RIDGE, OREGON</div>
+    <div class="when">YEAR TWO OF THE OCCUPATION &nbsp;·&nbsp; 17:30</div>
+  </div>
+
+  <div id="subtitle" hidden><span id="subtitle-speaker"></span><span id="subtitle-text"></span></div>
+
+  <div id="vitals">
+    <div id="health"><div id="health-fill"></div></div>
+    <div id="health-label">VITALS</div>
+  </div>
+
+  <div id="arms">
+    <div id="ammo"><span id="ammo-rounds">30</span><span id="ammo-reserve">/ 150</span></div>
+    <div id="weapon-name"></div>
+    <div id="grenades"></div>
+    <div id="arms-hint"></div>
+  </div>
+</div>
+
+<!-- Screens that stand over the game. -->
+<div id="title" class="screen">
+  <div class="title-block">
+    <div class="eyebrow">ALDER RIDGE, OREGON &nbsp;·&nbsp; YEAR TWO OF THE OCCUPATION</div>
+    <h1>HOLDOUT</h1>
+    <div class="mission-name">MISSION ONE &nbsp;—&nbsp; DEAD AIR</div>
+    <div id="loading">
+      <div id="loading-bar"><div id="loading-fill"></div></div>
+      <div id="loading-text">Starting…</div>
+    </div>
+    <div class="menu" id="title-menu" hidden>
+      <button id="play">Begin</button>
+      <button data-open="settings">Settings</button>
+      <button data-open="controls">Controls</button>
+    </div>
+  </div>
+  <div class="footnote">An original game on the Solstice engine · WebGPU</div>
+</div>
+
+<div id="pause" class="screen" hidden>
+  <div class="panel">
+    <h2>PAUSED</h2>
+    <div class="menu">
+      <button id="resume">Resume</button>
+      <button id="restart-checkpoint">Restart from checkpoint</button>
+      <button data-open="settings">Settings</button>
+      <button data-open="controls">Controls</button>
+    </div>
+  </div>
+</div>
+
+<div id="settings" class="screen" hidden>
+  <div class="panel wide">
+    <h2>SETTINGS</h2>
+    <label>Mouse sensitivity <input type="range" id="sensitivity" min="0.2" max="3" step="0.05" value="1"><output></output></label>
+    <label class="check"><input type="checkbox" id="invert"> Invert vertical look</label>
+    <label>Graphics quality
+      <select id="quality"><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
+    </label>
+    <label>Render scale <input type="range" id="scale" min="0.5" max="1" step="0.05" value="1"><output></output></label>
+    <label>Master volume <input type="range" id="volume" min="0" max="1" step="0.02" value="0.8"><output></output></label>
+    <label>Music volume <input type="range" id="music" min="0" max="1" step="0.02" value="0.6"><output></output></label>
+    <div class="menu"><button data-close>Back</button></div>
+  </div>
+</div>
+
+<div id="controls" class="screen" hidden>
+  <div class="panel wide">
+    <h2>CONTROLS</h2>
+    <table>
+      <tr><td><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></td><td>Move</td><td><kbd>Mouse</kbd></td><td>Look</td></tr>
+      <tr><td><kbd>Shift</kbd></td><td>Sprint</td><td><kbd>Left click</kbd></td><td>Fire</td></tr>
+      <tr><td><kbd>C</kbd> / <kbd>Ctrl</kbd></td><td>Crouch</td><td><kbd>Right click</kbd></td><td>Aim down sights</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>Jump</td><td><kbd>R</kbd></td><td>Reload</td></tr>
+      <tr><td><kbd>E</kbd></td><td>Use (hold)</td><td><kbd>G</kbd></td><td>Throw grenade</td></tr>
+      <tr><td><kbd>1</kbd> <kbd>2</kbd> / <kbd>Q</kbd></td><td>Carbine, pistol / swap</td><td><kbd>Wheel</kbd></td><td>Swap weapon</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Pause</td><td><kbd>F2</kbd></td><td>Free camera</td></tr>
+    </table>
+    <div class="menu"><button data-close>Back</button></div>
+  </div>
+</div>
+
+<div id="dead" class="screen ending" hidden>
+  <div class="panel">
+    <h2 class="red">KILLED IN ACTION</h2>
+    <p>The cell goes on without you.</p>
+    <div class="menu"><button id="retry">Retry from checkpoint</button></div>
+  </div>
+</div>
+
+<div id="complete" class="screen ending" hidden>
+  <div class="panel">
+    <div class="eyebrow">MISSION COMPLETE</div>
+    <h2>DEAD AIR</h2>
+    <p>The jammer is down. For the first time in two years, Alder Ridge can hear the rest of the country.</p>
+    <dl id="tally">
+      <div><dt>Time</dt><dd id="tally-time"></dd></div>
+      <div><dt>Directorate down</dt><dd id="tally-kills"></dd></div>
+      <div><dt>Accuracy</dt><dd id="tally-accuracy"></dd></div>
+      <div><dt>Head shots</dt><dd id="tally-heads"></dd></div>
+      <div><dt>Times killed</dt><dd id="tally-deaths"></dd></div>
+    </dl>
+    <div class="menu"><button id="again">Play again</button></div>
+  </div>
+</div>
+
+<div id="error" hidden></div>
+<div id="fps" hidden></div>
+
+<script type="module" src="game.js"></script>
+</body>
+</html>

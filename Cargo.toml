@@ -1,0 +1,35 @@
+# HOLDOUT: an original first-person shooter built on the Solstice engine (engine/).
+[workspace]
+resolver = "2"
+members = ["game", "levelc"]
+exclude = ["engine"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+solstice-anim = { path = "engine/crates/solstice-anim" }
+solstice-asset = { path = "engine/crates/solstice-asset" }
+solstice-builder = { path = "engine/crates/solstice-builder" }
+solstice-import = { path = "engine/crates/solstice-import" }
+solstice-procgen = { path = "engine/crates/solstice-procgen" }
+solstice-render = { path = "engine/crates/solstice-render" }
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.33", features = ["bytemuck"] }
+log = "0.4"
+pollster = "0.4"
+rayon = "1"
+wgpu = "30"
+
+# Geometry processing is unusably slow unoptimised.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"

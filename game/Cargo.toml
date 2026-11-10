@@ -1,0 +1,43 @@
+[package]
+name = "holdout"
+description = "HOLDOUT: an original first-person shooter on the Solstice engine, for the browser and the desktop."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The desktop runner: a window to play in, and headless captures for automated checks.
+[[bin]]
+name = "holdout-desktop"
+path = "src/main.rs"
+
+[dependencies]
+solstice-anim.workspace = true
+solstice-asset.workspace = true
+solstice-render.workspace = true
+glam.workspace = true
+log.workspace = true
+wgpu.workspace = true
+rapier3d = "0.36"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11"
+png = "0.17"
+pollster.workspace = true
+winit = "0.30"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+console_log = "1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Response",
+    "Window",
+] }

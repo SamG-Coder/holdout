@@ -1,0 +1,3 @@
+# The Solstice engine this game is built against: its repository and the commit.
+# tools/setup-engine.sh fetches it into engine/ and applies patches/solstice-engine.patch.
+SamG-Coder/solstice 78a80740ecc75ed91605ed12a5ed31018ff03853
