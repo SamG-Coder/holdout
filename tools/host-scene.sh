@@ -66,8 +66,8 @@ else
   for _ in $(seq 1 30); do hosted && break; sleep 4; done
   hosted || { echo "pushed $ref, but $url.parts.json is not being served" >&2; exit 1; }
 
-  # Keep this scene and the one before it.
-  git ls-remote "$remote" 'refs/scene/*' | cut -f2 | grep -v "^$ref\$" | sort -V | head -n -1 | while read -r old; do
+  # Keep this scene and the one before it. (A grep that finds nothing is no failure here.)
+  git ls-remote "$remote" 'refs/scene/*' | cut -f2 | { grep -v "^$ref\$" || true; } | sort -V | head -n -1 | while read -r old; do
     echo "letting go of $old" >&2
     git push -q "$remote" --delete "$old" >&2 || true
   done

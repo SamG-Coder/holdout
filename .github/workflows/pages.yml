@@ -45,7 +45,10 @@ jobs:
         id: host
         env:
           GH_TOKEN: ${{ github.token }}
-        run: echo "url=$(bash tools/host-scene.sh)" >> "$GITHUB_OUTPUT"
+        run: |
+          url=$(bash tools/host-scene.sh)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "The level is served from $url" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: scene
@@ -67,7 +70,11 @@ jobs:
           cache-directories: build/tools
 
       - name: Build the site
-        run: bash tools/build-web.sh --scene-url "${{ needs.scene.outputs.url }}"
+        env:
+          SCENE_URL: ${{ needs.scene.outputs.url }}
+        run: |
+          [ -n "$SCENE_URL" ] || { echo "the scene job gave no address for the level" >&2; exit 1; }
+          bash tools/build-web.sh --scene-url "$SCENE_URL"
 
       - uses: actions/upload-pages-artifact@v3
         with:
