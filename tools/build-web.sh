@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # Builds the browser game into dist/, a self-contained static site.
 #
-#   bash tools/build-web.sh [--split] [LEVEL.solstice]
+#   bash tools/build-web.sh [--split | --scene-url URL] [LEVEL.solstice]
 #
-# The level defaults to build/levels/alder_ridge.solstice. With --split it is cut into parts
-# of 64 MiB with a note of how, which the page reads as it would the one file: GitHub Pages
-# will not deploy a single file of several hundred megabytes. To try it:
+# The level defaults to build/levels/alder_ridge.solstice, and goes beside the game. With
+# --split it is cut into parts of 32 MiB with a note of how, which the page reads as it would
+# the one file: for hosts that will not take a single file so large. With --scene-url no level
+# goes in at all: the page is told to stream it from that address (see tools/host-scene.sh).
+# To try it:
 #   python engine/scripts/serve.py --directory dist --port 8765
 # and open http://localhost:8765 in Chrome or Edge.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 split_level=false
+scene_url=""
 if [ "${1:-}" = "--split" ]; then split_level=true; shift; fi
+if [ "${1:-}" = "--scene-url" ]; then scene_url="$2"; shift 2; fi
 level="${1:-build/levels/alder_ridge.solstice}"
 version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
 bindgen="build/tools/bin/wasm-bindgen"
@@ -29,9 +33,11 @@ mkdir -p dist/pkg dist/assets
 "$bindgen" --target web --no-typescript --out-dir dist/pkg \
   target/web/wasm32-unknown-unknown/release/holdout.wasm
 cp web/index.html web/style.css web/game.js web/audio.js dist/
-rm -f dist/assets/level.solstice dist/assets/level.solstice.*
-if [ -e "$level" ] && $split_level; then
-  part=$((64 * 1024 * 1024))
+rm -f dist/assets/level.solstice dist/assets/level.solstice.* dist/assets/scene.url
+if [ -n "$scene_url" ]; then
+  echo "$scene_url" > dist/assets/scene.url
+elif [ -e "$level" ] && $split_level; then
+  part=$((32 * 1024 * 1024))
   split -b "$part" -d -a 3 "$level" dist/assets/level.solstice.
   size=$(wc -c < "$level" | tr -d ' ')
   count=$(ls dist/assets/level.solstice.[0-9][0-9][0-9] | wc -l | tr -d ' ')

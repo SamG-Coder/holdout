@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Publishes a compiled level: uploads it to a new GitHub release and records that release in
-# scene.txt. Committing and pushing scene.txt is what deploys it: the Pages workflow
-# downloads the scene the file names, checks it, and serves it beside the game.
+# scene.txt. Committing and pushing scene.txt is what deploys it: the Pages workflow takes
+# the scene the file names from its release, checks it, hosts it where the game can stream
+# it (tools/host-scene.sh), and points the game at it.
 #
 #   bash tools/publish-scene.sh [LEVEL.solstice] [TAG]
 #
@@ -34,9 +35,9 @@ gh release create "$tag" "$level" \
 Built from \`art/levels/\` with \`levelc\`. The Pages workflow serves the scene that \`scene.txt\` names."
 
 cat > scene.txt <<EOF
-# The scene the site serves: its file name, the release that holds it (a tag of this
-# repository, or OWNER/REPO@TAG) and its SHA-256. Written by tools/publish-scene.sh;
-# pushing a change to this file deploys the new scene.
+# The scene the game streams: its file name, the release of this repository that holds it,
+# and its SHA-256. Written by tools/publish-scene.sh; pushing a change to this file hosts
+# the new scene and deploys the game to read it.
 $name $tag $digest
 EOF
 echo "scene.txt now names $tag. To deploy it:"

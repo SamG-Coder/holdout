@@ -90,11 +90,12 @@ flowchart LR
   end
   S -- "tools/publish-scene.sh" --> R["GitHub Release"]
   subgraph CI [GitHub Actions]
+    R -- "check SHA-256,<br>cut into parts" --> H["refs/scene/TAG"]
     G["game/ in Rust"] --> W["WebAssembly<br>4 MB"]
-    R -- "download + SHA-256 check" --> D["site"]
-    W --> D
   end
-  D --> GP["GitHub Pages"]
+  W --> GP["GitHub Pages<br>the game"]
+  H --> RAW["raw.githubusercontent.com<br>the level, by Range"]
+  RAW -. "streamed as you play" .-> GP
 ```
 
 **The game** (`game/`) is Rust compiled to WebAssembly. It draws with Solstice: virtualised
@@ -123,19 +124,27 @@ game shows as it needs them.
 
 ## Hosting
 
-The level needs Blender and a good many minutes to build, so CI does not build it:
+The level needs Blender and a good many minutes to build, so CI does not build it. And at half
+a gigabyte it is awkward to serve: a release download cannot be read by a page on another
+origin, and GitHub Pages will not deploy a site that size. So it is kept in one place and
+served from another:
 
 1. `tools/publish-scene.sh` uploads the compiled level to a **GitHub Release** and writes the
-   release's tag and the file's SHA-256 into [`scene.txt`](scene.txt).
-2. Pushing to `main` runs [the Pages workflow](.github/workflows/pages.yml). It fetches the
-   engine at the commit [`engine.txt`](engine.txt) names, compiles the game to WebAssembly,
-   downloads the scene `scene.txt` names, checks its hash, cuts it into 64 MiB parts, and
-   deploys the lot to **GitHub Pages**.
+   release's tag and the file's SHA-256 into [`scene.txt`](scene.txt). The release is the
+   level's home.
+2. Pushing to `main` runs [the Pages workflow](.github/workflows/pages.yml):
+   - **scene** takes the level from its release, checks its hash, cuts it into 32 MiB parts
+     and pushes them to `refs/scene/TAG` in this repository ([`tools/host-scene.sh`](tools/host-scene.sh)).
+     That is not a branch, so cloning the repository does not fetch it, but
+     `raw.githubusercontent.com` serves it with HTTP Range and CORS, which is what streaming
+     needs. A scene already hosted is only checked.
+   - **build** and **deploy** compile the game against the engine at the commit
+     [`engine.txt`](engine.txt) names, and put it on **GitHub Pages** with a one-line note of
+     where its level is.
 
-The scene is served from the same site as the game, because the game reads it by HTTP Range
-and release downloads cannot be fetched across origins. It is served in parts because Pages
-will not deploy a single file of several hundred megabytes; the page reads across the parts
-as it would the one file (`tools/build-web.sh --split`).
+The page reads the level in 2 MiB blocks across the parts: a few hundred requests for a whole
+play-through. The two newest scenes are kept hosted, so that publishing a new one does not
+cut off a game in progress.
 
 ## Building it yourself
 

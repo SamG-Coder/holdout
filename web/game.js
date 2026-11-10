@@ -7,7 +7,22 @@ import { Sound } from "./audio.js";
 const params = new URLSearchParams(location.search);
 const el = (id) => document.getElementById(id);
 const canvas = el("view");
-const sceneUrl = params.get("scene") ?? "assets/level.solstice";
+
+/// Where the scene is: the address's own `?scene=`, else what `assets/scene.url` says (the
+/// published site keeps its scene on another host, which that file names), else the level
+/// built beside the page.
+async function sceneAddress() {
+  const asked = params.get("scene");
+  if (asked) return asked;
+  try {
+    const note = await fetch("assets/scene.url", { cache: "no-cache" });
+    const text = note.ok ? (await note.text()).trim() : "";
+    if (/^https?:\/\//.test(text)) return text;
+  } catch {
+    // No note: the scene is here.
+  }
+  return "assets/level.solstice";
+}
 const megabytes = (name, fallback) => (Number(params.get(name)) || fallback) * 1048576;
 
 function fail(text) {
@@ -23,11 +38,19 @@ function progress(share, text) {
 
 /// Reads parts of the scene by HTTP Range. The scene is one file or, where a host will not
 /// take a file so large, that file cut into equal parts with a note beside it
-/// (`NAME.parts.json`: the whole size, the size of a part, how many). A server that doesn't do
-/// ranges sends a whole file once, and what is asked of it is then cut from memory.
+/// (`NAME.parts.json`: the whole size, the size of a part, how many).
+///
+/// It is fetched in whole blocks of 2 MiB, the latest of which are kept: the renderer asks for
+/// thousands of small pieces, most of them neighbours, and a host is far happier with a few
+/// hundred requests than with ten thousand. A server that doesn't do ranges sends a whole
+/// file once, and what is asked of it is then cut from memory.
 class SceneFile {
+  static BLOCK = 2 * 1024 * 1024;
+  static KEEP = 48;
   #url;
   #parts = null;
+  #size = Infinity;
+  #blocks = new Map();
   #wholes = new Map();
 
   static async open(url) {
@@ -35,7 +58,10 @@ class SceneFile {
     file.#url = url;
     try {
       const note = await fetch(`${url}.parts.json`);
-      if (note.ok) file.#parts = await note.json();
+      if (note.ok) {
+        file.#parts = await note.json();
+        file.#size = file.#parts.size;
+      }
     } catch {
       // No note: the scene is one file.
     }
@@ -43,13 +69,47 @@ class SceneFile {
   }
 
   async read(start, end) {
+    const size = SceneFile.BLOCK;
+    const first = Math.floor(start / size);
+    const last = Math.floor((end - 1) / size);
+    const blocks = await Promise.all(Array.from({ length: last - first + 1 }, (_, i) => this.#block(first + i)));
+    if (first === last) return blocks[0].subarray(start - first * size, end - first * size);
+    const out = new Uint8Array(end - start);
+    blocks.forEach((block, i) => {
+      const from = (first + i) * size;
+      const piece = block.subarray(Math.max(start - from, 0), Math.min(end - from, block.length));
+      out.set(piece, Math.max(from - start, 0));
+    });
+    return out;
+  }
+
+  /// One block, from memory if it was lately read. Those not used for longest are let go.
+  #block(index) {
+    let block = this.#blocks.get(index);
+    if (block) {
+      this.#blocks.delete(index);
+      this.#blocks.set(index, block);
+      return block;
+    }
+    const start = index * SceneFile.BLOCK;
+    block = this.#span(start, Math.min(start + SceneFile.BLOCK, this.#size));
+    block.catch(() => this.#blocks.delete(index));
+    this.#blocks.set(index, block);
+    for (const oldest of this.#blocks.keys()) {
+      if (this.#blocks.size <= SceneFile.KEEP) break;
+      this.#blocks.delete(oldest);
+    }
+    return block;
+  }
+
+  /// A span of the scene, from its one file or across its parts.
+  async #span(start, end) {
     if (!this.#parts) return this.#readFrom(this.#url, start, end);
     const size = this.#parts.part;
     const first = Math.floor(start / size);
     const last = Math.floor((end - 1) / size);
     const name = (index) => `${this.#url}.${String(index).padStart(3, "0")}`;
     if (first === last) return this.#readFrom(name(first), start - first * size, end - first * size);
-    // Across the join of two parts or more: read from each, and put them end to end.
     const pieces = await Promise.all(Array.from({ length: last - first + 1 }, (_, i) => {
       const index = first + i;
       return this.#readFrom(name(index), Math.max(start - index * size, 0), Math.min(end - index * size, size));
@@ -65,10 +125,12 @@ class SceneFile {
 
   async #readFrom(url, start, end) {
     const whole = this.#wholes.get(url);
-    if (whole) return whole.subarray(start, end);
+    if (whole) return (await whole).subarray(start, end);
     const response = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` } });
     if (!response.ok) throw new Error(`Could not load ${url} (HTTP ${response.status}).`);
-    if (response.status === 200) {
+    if (response.status !== 200) return new Uint8Array(await response.arrayBuffer());
+    // The whole file is coming, like it or not: take it once, whoever else asks meanwhile.
+    const taking = (async () => {
       const total = Number(response.headers.get("content-length")) || 0;
       const reader = response.body.getReader();
       const chunks = [];
@@ -86,10 +148,10 @@ class SceneFile {
         all.set(chunk, offset);
         offset += chunk.length;
       }
-      this.#wholes.set(url, all);
-      return all.subarray(start, end);
-    }
-    return new Uint8Array(await response.arrayBuffer());
+      return all;
+    })();
+    this.#wholes.set(url, taking);
+    return (await taking).subarray(start, end);
   }
 }
 
@@ -344,7 +406,7 @@ async function main() {
   await init();
 
   progress(0.05, "Reading Alder Ridge…");
-  const file = await SceneFile.open(sceneUrl);
+  const file = await SceneFile.open(await sceneAddress());
   const [manifestOffset, manifestBytes] = read_header(await file.read(0, header_bytes()));
   const manifest = await inflate(await file.read(manifestOffset, manifestOffset + manifestBytes));
 
