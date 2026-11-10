@@ -1,0 +1,79 @@
+name: Pages
+
+# Builds the game for the browser and serves it with its level.
+#
+# The game is compiled here: Rust to WebAssembly, against the Solstice engine at the commit
+# engine.txt names. The level is not: it takes Blender and a good many minutes to build, so
+# it is built on a PC and published as a release (tools/publish-scene.sh). This downloads the
+# scene scene.txt names, checks it against the recorded SHA-256, and puts it beside the game,
+# which streams it from the same site by HTTP Range.
+
+on:
+  push:
+    branches: [main]
+    # Neither the documentation nor the art scripts change what the site serves.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "art/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the engine
+        run: bash tools/setup-engine.sh
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The web build has a target folder of its own, and installs wasm-bindgen beside it.
+          workspaces: ". -> target/web"
+          cache-directories: build/tools
+
+      - name: Download and check the scene
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          read -r name release digest < <(grep -v '^#' scene.txt | grep .)
+          # A release is a tag of this repository, or OWNER/REPO@TAG.
+          if [[ "$release" == *@* ]]; then repo=${release%@*}; tag=${release#*@}; else repo=${{ github.repository }}; tag=$release; fi
+          mkdir -p build/levels
+          gh release download "$tag" --repo "$repo" --pattern "$name" --dir build/levels
+          echo "$digest  build/levels/$name" | sha256sum --check
+          echo "SCENE=build/levels/$name" >> "$GITHUB_ENV"
+
+      - name: Build the site
+        run: bash tools/build-web.sh "$SCENE"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+        with:
+          # The scene is hundreds of megabytes: give the deployment time to take it.
+          timeout: 1800000

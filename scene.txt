@@ -1,0 +1,4 @@
+# The scene the site serves: its file name, the release that holds it (a tag of this
+# repository, or OWNER/REPO@TAG) and its SHA-256. Written by tools/publish-scene.sh;
+# pushing a change to this file deploys the new scene.
+alder_ridge.solstice scene-2026-11-11 bcec49c532a5035c8992cceb0a91cf6b88c9bc338f0222769ce485f4ac65b663
