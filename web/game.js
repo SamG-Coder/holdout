@@ -240,9 +240,23 @@ const canvasSize = () => {
 
 // ------------------------------------------------------------------------------ Settings
 
+const SETTINGS_KEY = "holdout-settings";
+
+/// The settings saved last time, or none: storage can be blocked, full, or hold something
+/// that is not ours to read, and none of that should keep the game from starting.
+function savedSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "{}");
+    return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {};
+  } catch (error) {
+    console.warn("Ignoring saved settings that could not be read:", error);
+    return {};
+  }
+}
+
 const settings = {
   sensitivity: 1, invert: false, quality: "high", scale: 1, volume: 0.8, music: 0.6,
-  ...JSON.parse(localStorage.getItem("holdout-settings") ?? "{}"),
+  ...savedSettings(),
 };
 
 function applySettings(game, sound) {
@@ -250,7 +264,11 @@ function applySettings(game, sound) {
   game?.set_quality(settings.quality);
   game?.set_render_scale(settings.scale);
   sound?.setVolumes(settings.volume, settings.music);
-  localStorage.setItem("holdout-settings", JSON.stringify(settings));
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch (error) {
+    console.warn("Settings could not be saved, and will last only until the page closes:", error);
+  }
 }
 
 function bindSettings(game, sound) {
@@ -512,7 +530,20 @@ async function main() {
   canvas.addEventListener("contextmenu", (event) => event.preventDefault());
   window.addEventListener("blur", () => game.release_all());
 
+  // A frame that throws stops the loop and says why, rather than leaving a frozen picture.
   function tick(now) {
+    try {
+      step(now);
+    } catch (error) {
+      console.error(error);
+      document.exitPointerLock?.();
+      fail(`The game stopped: ${error?.message ?? error}. Reload the page to start again.`);
+      return;
+    }
+    requestAnimationFrame(tick);
+  }
+
+  function step(now) {
     const seconds = Math.min((now - last) / 1000, 0.1);
     last = now;
     const [width, height] = canvasSize();
@@ -551,7 +582,6 @@ async function main() {
       frames = 0;
       fpsSince = now;
     }
-    requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
 
