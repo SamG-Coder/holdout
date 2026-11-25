@@ -2,13 +2,14 @@
 //! and pick up, grenades, and what the interface is told.
 
 use crate::ai::{Noise, Team};
-use crate::mission::{Do, Facts, State};
+use crate::mission::{Do, Facts};
 use crate::npc::Zone;
 use crate::physics::Loose;
+use crate::weapons::{self, Gun};
 use crate::{Game, View};
 use glam::{Mat4, Quat, Vec3};
-use solstice_render::{Renderer, Weather};
-use std::collections::HashMap;
+use solstice_render::{EffectId, Renderer, Weather};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 /// A grenade in the air or on the ground, counting down.
@@ -19,18 +20,56 @@ pub struct Grenade {
     pub team: Team,
 }
 
-/// Where the player was when the mission last said to remember it.
-#[derive(Clone, Copy, Debug)]
+/// Something a mission did to the level that a return to an earlier checkpoint undoes.
+pub enum Aftermath {
+    /// A thing blown up: its name among the swaps.
+    Wrecked(String),
+    /// A fire lit where something blew up.
+    Burning(EffectId),
+}
+
+/// Where the player was when the mission last said to remember it, and how things stood.
+#[derive(Clone, Debug)]
 pub struct Saved {
     pub feet: Vec3,
     pub yaw: f32,
-    pub rounds: u32,
-    pub reserve: u32,
+    /// What each gun had in reserve, in the arsenal's order.
+    pub reserves: Vec<u32>,
     pub grenades: u32,
+    /// The `use` markers already used.
+    pub used: HashSet<String>,
+    /// How much of the level's aftermath had happened.
+    pub aftermath: usize,
 }
 
+impl Saved {
+    /// Each gun as it was at the checkpoint, and better: a full magazine, at least three more
+    /// in reserve, and never more than the gun can carry.
+    pub fn rearm(&self, guns: &mut [Gun]) {
+        for (gun, &reserve) in guns.iter_mut().zip(&self.reserves) {
+            gun.rounds = gun.def.magazine;
+            gun.reserve = reserve.max(gun.def.magazine * 3).min(gun.def.reserve);
+        }
+    }
+}
+
+/// Text made safe to stand between the quotes of a JSON string.
 fn escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => {
+                write!(out, "\\u{:04x}", u32::from(c)).ok();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl Game {
@@ -59,8 +98,12 @@ impl Game {
             let rig = &self.rigs[npc.rig];
             let away = (chest - centre).normalize_or(Vec3::Y);
             let npc = &mut self.npcs[index];
+            let enemy = npc.brain.team != team;
             npc.brain.hit(at);
-            npc.hurt(damage, away, Zone::Torso, rig);
+            // The player's side sets off only what the player did: grenades and the charge.
+            if npc.hurt(damage, away, Zone::Torso, rig) && enemy && team == Team::Resistance {
+                self.tally.kills += 1;
+            }
         }
         let chest = self.player.chest();
         let distance = chest.distance(centre);
@@ -69,7 +112,9 @@ impl Game {
             self.since_hurt = 0.0;
             self.hurt_flash = 1.0;
             self.hurt_from = at;
-            self.player.hurt(damage);
+            if !self.god {
+                self.player.hurt(damage);
+            }
         }
     }
 
@@ -90,51 +135,96 @@ impl Game {
             alive: &alive,
             used: &self.used,
         };
-        let commands = self.mission.update(&facts, dt);
-        for command in commands {
-            match command {
-                Do::Spawn(group) => self.spawn_group(renderer, group),
-                Do::Alert(group) => {
-                    let at = self.player.chest();
-                    for &index in self.groups.get(group).map_or(&[][..], Vec::as_slice) {
-                        self.npcs[index].brain.alert(at, true);
-                    }
+        for command in self.mission.update(&facts, dt) {
+            self.carry_out(renderer, command);
+        }
+        self.set_off_blasts(dt);
+        if self.mission.checkpoint != self.saved_stage {
+            self.saved_stage = self.mission.checkpoint;
+            self.saved = Some(Saved {
+                feet: self.player.feet,
+                yaw: self.player.yaw,
+                reserves: self.arsenal.guns.iter().map(|gun| gun.reserve).collect(),
+                grenades: self.grenades_left,
+                used: self.used.clone(),
+                aftermath: self.aftermath.len(),
+            });
+        }
+        self.use_things(dt, use_held);
+        self.loot_the_dead(dt);
+        self.pick_things_up(renderer);
+        if throw && self.grenades_left > 0 && self.player.alive {
+            self.throw_grenade();
+        }
+        self.run_grenades(renderer, dt);
+
+        // The fight's heat, for the music: rises with enemies fighting, falls away after.
+        let fighting = self
+            .npcs
+            .iter()
+            .filter(|npc| npc.active && npc.alive && npc.brain.team == Team::Directorate && npc.brain.fighting())
+            .count();
+        let wanted = (fighting as f32 / 3.0).min(1.0);
+        let rate = if wanted > self.audio.intensity { 1.2 } else { 0.12 };
+        self.audio.intensity += (wanted - self.audio.intensity) * (1.0 - (-dt * rate).exp());
+    }
+
+    /// Does one thing the mission asked for.
+    fn carry_out(&mut self, renderer: &mut Renderer, command: Do) {
+        match command {
+            Do::Spawn(group) => self.spawn_group(renderer, group),
+            Do::Alert(group) => {
+                let at = self.player.chest();
+                for &index in self.groups.get(group).map_or(&[][..], Vec::as_slice) {
+                    self.npcs[index].brain.alert(at, true);
                 }
-                Do::Sound(name) => self.audio.own(name, 1.0),
-                Do::Explode(goal) => {
-                    if let Some(at) = self.mission.goal_named(goal) {
-                        self.explosion(at, Team::Resistance);
-                        // A charge that kills a lorry is not one bang: what it carried goes
-                        // up after it, over the next second.
-                        for (delay, offset) in [
-                            (0.14, Vec3::new(1.7, 0.9, -0.7)),
-                            (0.32, Vec3::new(-1.9, 1.6, 0.8)),
-                            (0.55, Vec3::new(0.4, 2.6, 0.3)),
-                            (0.8, Vec3::new(-0.8, 0.7, -1.4)),
-                            (1.15, Vec3::new(2.3, 1.9, 1.1)),
-                        ] {
-                            self.blasts.push((delay, at + offset));
-                        }
-                    }
-                    self.wreck(renderer, goal, true);
+            }
+            Do::Sound(name) => self.audio.own(name, 1.0),
+            Do::Explode(goal) => self.blow_up(renderer, goal),
+            Do::Burn(goal) => {
+                if let Some(at) = self.mission.goal_named(goal) {
+                    let lit = [
+                        self.fx.smoulder(renderer, at + Vec3::Y * 1.0, 1.6),
+                        self.fx.smoulder(renderer, at + Vec3::new(-3.2, 0.8, -1.2), 1.2),
+                        self.fx.fire(renderer, at + Vec3::new(-1.0, 0.4, -1.6), 2.4),
+                        self.fx.fire(renderer, at + Vec3::new(-4.6, 0.9, -1.4), 1.8),
+                    ];
+                    self.aftermath.extend(lit.into_iter().flatten().map(Aftermath::Burning));
                 }
-                Do::Burn(goal) => {
-                    if let Some(at) = self.mission.goal_named(goal) {
-                        self.fx.smoulder(renderer, at + Vec3::Y * 1.0, 1.6);
-                        self.fx.smoulder(renderer, at + Vec3::new(-3.2, 0.8, -1.2), 1.2);
-                        self.fx.fire(renderer, at + Vec3::new(-1.0, 0.4, -1.6), 2.4);
-                        self.fx.fire(renderer, at + Vec3::new(-4.6, 0.9, -1.4), 1.8);
-                    }
+            }
+            Do::Weather(name, seconds) => {
+                if let Some(weather) = Weather::by_name(name) {
+                    renderer.set_weather(weather, seconds);
                 }
-                Do::Weather(name, seconds) => {
-                    if let Some(weather) = Weather::by_name(name) {
-                        renderer.set_weather(weather, seconds);
-                    }
-                }
-                Do::Checkpoint | Do::Say(..) | Do::Complete => {}
+            }
+            Do::Checkpoint | Do::Say(..) | Do::Complete => {}
+        }
+    }
+
+    /// Sets off a charge at a goal, and leaves the wreck of whatever stood there.
+    fn blow_up(&mut self, renderer: &mut Renderer, goal: &str) {
+        if let Some(at) = self.mission.goal_named(goal) {
+            self.explosion(at, Team::Resistance);
+            // A charge that kills a lorry is not one bang: what it carried goes up after it,
+            // over the next second.
+            for (delay, offset) in [
+                (0.14, Vec3::new(1.7, 0.9, -0.7)),
+                (0.32, Vec3::new(-1.9, 1.6, 0.8)),
+                (0.55, Vec3::new(0.4, 2.6, 0.3)),
+                (0.8, Vec3::new(-0.8, 0.7, -1.4)),
+                (1.15, Vec3::new(2.3, 1.9, 1.1)),
+            ] {
+                self.blasts.push((delay, at + offset));
             }
         }
-        // The explosions still to come.
+        if self.swaps.contains_key(goal) {
+            self.wreck(renderer, goal, true);
+            self.aftermath.push(Aftermath::Wrecked(goal.to_owned()));
+        }
+    }
+
+    /// The explosions still to come, as each one's time arrives.
+    fn set_off_blasts(&mut self, dt: f32) {
         let mut due = Vec::new();
         self.blasts.retain_mut(|(delay, at)| {
             *delay -= dt;
@@ -147,19 +237,10 @@ impl Game {
             self.fx.explode(at, self.player.eye());
             self.audio.at("explosion", at, 0.85);
         }
-        if self.mission.checkpoint != self.saved_stage {
-            self.saved_stage = self.mission.checkpoint;
-            let gun = self.arsenal.gun();
-            self.saved = Some(Saved {
-                feet: self.player.feet,
-                yaw: self.player.yaw,
-                rounds: gun.rounds,
-                reserve: gun.reserve,
-                grenades: self.grenades_left,
-            });
-        }
+    }
 
-        // Things to use: stand by one, look at it, and hold the key.
+    /// Things to use: stand by one, look at it, and hold the key.
+    fn use_things(&mut self, dt: f32, use_held: bool) {
         self.prompt = None;
         let eye = self.player.eye();
         let looking = self.player.forward();
@@ -196,8 +277,10 @@ impl Game {
             }
             _ => self.use_progress = 0.0,
         }
+    }
 
-        // What the dead carried: walk over a fallen rifle for what was left in it.
+    /// What the dead carried: walk over a fallen rifle for what was left in it.
+    fn loot_the_dead(&mut self, dt: f32) {
         let mut found = 0;
         for npc in &mut self.npcs {
             if !npc.active || npc.looted || npc.brain.team != Team::Directorate {
@@ -206,7 +289,9 @@ impl Game {
             if let Some(at) = npc.fallen_weapon() {
                 let apart = at - self.player.feet;
                 if apart.x.hypot(apart.z) < 1.25 && apart.y.abs() < 1.6 {
-                    let taken = self.arsenal.add_rounds(12 + (npc.position.x.abs() * 7.0) as u32 % 13);
+                    // A soldier's rifle holds rifle rounds, whatever the player has in hand.
+                    let rounds = 12 + (npc.position.x.abs() * 7.0) as u32 % 13;
+                    let taken = self.arsenal.add_rounds_to(weapons::CARBINE, rounds);
                     if taken > 0 {
                         npc.looted = true;
                         found += taken;
@@ -224,14 +309,16 @@ impl Game {
                 self.picked_up = None;
             }
         }
+    }
 
-        // Things to pick up: walk over them.
+    /// Things to pick up: walk over them.
+    fn pick_things_up(&mut self, renderer: &mut Renderer) {
         for index in 0..self.pickups.len() {
             let (at, taken, rounds) = self.pickups[index];
             if taken || at.distance(self.player.feet + Vec3::Y * 0.5) > 1.3 {
                 continue;
             }
-            if self.arsenal.add_rounds(rounds) > 0 {
+            if self.arsenal.add_rounds_to(self.arsenal.current, rounds) > 0 {
                 self.pickups[index].1 = true;
                 self.grenades_left = (self.grenades_left + 1).min(4);
                 self.audio.own("pickup", 1.0);
@@ -240,25 +327,29 @@ impl Game {
                 }
             }
         }
+    }
 
-        // Grenades: thrown along the view, a little upward.
-        if throw && self.grenades_left > 0 && self.player.alive {
-            self.grenades_left -= 1;
-            let forward = self.player.forward();
-            let from = eye + forward * 0.5 + self.player.right() * 0.15;
-            let velocity = (forward + Vec3::Y * 0.28).normalize() * 15.0 + self.player.velocity;
-            let body = self.physics.add_loose_ball(from, velocity, Vec3::new(6.0, 2.0, 9.0), 0.045, 0.4, 0.35);
-            let group = (0..self.grenade_pool.len()).find(|index| {
-                !self.grenades.iter().any(|grenade| grenade.group == Some(*index))
-            });
-            self.grenades.push(Grenade {
-                body,
-                fuse: 3.0,
-                group,
-                team: Team::Resistance,
-            });
-            self.audio.own("grenade_throw", 0.9);
-        }
+    /// Throws a grenade along the view, a little upward.
+    fn throw_grenade(&mut self) {
+        self.grenades_left -= 1;
+        let forward = self.player.forward();
+        let from = self.player.eye() + forward * 0.5 + self.player.right() * 0.15;
+        let velocity = (forward + Vec3::Y * 0.28).normalize() * 15.0 + self.player.velocity;
+        let body = self.physics.add_loose_ball(from, velocity, Vec3::new(6.0, 2.0, 9.0), 0.045, 0.4, 0.35);
+        let group = (0..self.grenade_pool.len()).find(|index| {
+            !self.grenades.iter().any(|grenade| grenade.group == Some(*index))
+        });
+        self.grenades.push(Grenade {
+            body,
+            fuse: 3.0,
+            group,
+            team: Team::Resistance,
+        });
+        self.audio.own("grenade_throw", 0.9);
+    }
+
+    /// Grenades in flight: drawn where they are, and set off when their fuses run out.
+    fn run_grenades(&mut self, renderer: &mut Renderer, dt: f32) {
         let mut gone_off = Vec::new();
         let mut index = 0;
         while index < self.grenades.len() {
@@ -291,16 +382,6 @@ impl Game {
         for (at, team) in gone_off {
             self.explosion(at, team);
         }
-
-        // The fight's heat, for the music: rises with enemies fighting, falls away after.
-        let fighting = self
-            .npcs
-            .iter()
-            .filter(|npc| npc.active && npc.alive && npc.brain.team == Team::Directorate && npc.brain.fighting())
-            .count();
-        let wanted = (fighting as f32 / 3.0).min(1.0);
-        let rate = if wanted > self.audio.intensity { 1.2 } else { 0.12 };
-        self.audio.intensity += (wanted - self.audio.intensity) * (1.0 - (-dt * rate).exp());
     }
 
     /// Whether the game is still waiting under its title, nothing yet played.
@@ -353,29 +434,32 @@ impl Game {
         }
     }
 
-    /// Puts the player back at the last point the mission remembered, whole and reloaded.
+    /// Puts the player back at the last point the mission remembered, whole and reloaded, with
+    /// the level as it stood then.
     pub fn restart(&mut self, renderer: &mut Renderer) {
-        // Whatever was blown up after the point gone back to stands again.
-        let names: Vec<String> = self.swaps.keys().cloned().collect();
-        for name in names {
-            self.wreck(renderer, &name, false);
-        }
         if !self.player.alive {
             self.tally.deaths += 1;
         }
-        self.mission.retry();
+        for group in self.mission.retry() {
+            for index in self.groups.remove(group).unwrap_or_default() {
+                self.release_cover(index);
+                self.npcs[index].leave(renderer, &mut self.physics);
+            }
+        }
         self.player.alive = true;
         self.player.health = 100.0;
         self.hurt_flash = 0.0;
         self.since_hurt = 100.0;
         self.use_progress = 0.0;
-        match self.saved {
+        self.clear_explosives(renderer);
+        let saved = self.saved.clone();
+        self.undo_aftermath(renderer, saved.as_ref().map_or(0, |saved| saved.aftermath));
+        match saved {
             Some(saved) => {
                 self.player.place(&mut self.physics, saved.feet, saved.yaw);
-                let gun = &mut self.arsenal.guns[self.arsenal.current];
-                gun.rounds = saved.rounds.max(gun.def.magazine);
-                gun.reserve = saved.reserve.max(gun.def.magazine * 3);
+                saved.rearm(&mut self.arsenal.guns);
                 self.grenades_left = saved.grenades.max(2);
+                self.used = saved.used;
             }
             None => {
                 let (feet, yaw) = self
@@ -383,6 +467,7 @@ impl Game {
                     .marker("player", "start")
                     .map_or((self.player.feet, 0.0), |marker| (marker.position, marker.yaw));
                 self.player.place(&mut self.physics, feet, yaw);
+                self.used.clear();
             }
         }
         // Whoever was hunting the player forgets where they were.
@@ -393,9 +478,32 @@ impl Game {
         }
     }
 
+    /// Takes away grenades still live and explosions still to come.
+    fn clear_explosives(&mut self, renderer: &mut Renderer) {
+        for grenade in std::mem::take(&mut self.grenades) {
+            if let Some(group) = grenade.group {
+                self.grenade_pool[group].set_hidden(renderer, true);
+            }
+            self.physics.remove_loose(grenade.body);
+        }
+        self.blasts.clear();
+    }
+
+    /// Undoes what happened to the level after the first `keep` things: wrecks stand whole
+    /// again and fires go out.
+    fn undo_aftermath(&mut self, renderer: &mut Renderer, keep: usize) {
+        let keep = keep.min(self.aftermath.len());
+        let undone: Vec<Aftermath> = self.aftermath.drain(keep..).collect();
+        for aftermath in undone {
+            match aftermath {
+                Aftermath::Wrecked(name) => self.wreck(renderer, &name, false),
+                Aftermath::Burning(id) => renderer.particles().kill(id),
+            }
+        }
+    }
+
     /// The view as it last was, for drawing while the game is held still.
-    pub fn still(&mut self, renderer: &mut Renderer) -> View {
-        let _ = renderer;
+    pub fn still(&mut self) -> View {
         // Before the first step is taken, the title stands over a view of the level chosen
         // for it, turning slowly, rather than over the wall the player happens to face.
         if self.frames <= 1 {
@@ -444,11 +552,7 @@ impl Game {
             (sx * 0.5 + 0.5, 0.5 - sy * 0.5, distance, inside)
         };
         let mut out = String::with_capacity(512);
-        let state = match self.mission.state {
-            State::Playing => "playing",
-            State::Dead => "dead",
-            State::Complete => "complete",
-        };
+        let state = self.mission.state.name();
         let hurt = self.hurt_from - camera.position;
         let hurt_angle = hurt.dot(right).atan2(hurt.dot(forward)).to_degrees();
         write!(
@@ -518,4 +622,48 @@ impl Game {
 /// The turn that stands a thing upright at a place, facing a yaw.
 pub fn upright(position: Vec3, yaw: f32) -> Mat4 {
     Mat4::from_rotation_translation(Quat::from_rotation_y(yaw), position)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_strings_are_escaped() {
+        assert_eq!(escape(r#"say "hi" \ go"#), r#"say \"hi\" \\ go"#);
+        assert_eq!(escape("a\nb\tc\u{1}"), "a\\nb\\tc\\u0001");
+        assert_eq!(escape("plain, ünïcode"), "plain, ünïcode");
+    }
+
+    fn saved(reserves: Vec<u32>) -> Saved {
+        Saved {
+            feet: Vec3::ZERO,
+            yaw: 0.0,
+            reserves,
+            grenades: 2,
+            used: HashSet::new(),
+            aftermath: 0,
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_rearms_each_gun_with_its_own_rounds() {
+        let mut guns = vec![Gun::new(weapons::carbine()), Gun::new(weapons::pistol())];
+        for gun in &mut guns {
+            gun.rounds = 1;
+        }
+        saved(vec![140, 20]).rearm(&mut guns);
+        let (carbine, pistol) = (&guns[0], &guns[1]);
+        assert_eq!((carbine.rounds, carbine.reserve), (carbine.def.magazine, 140));
+        // The pistol is given what the pistol had, topped up: never the carbine's rounds.
+        assert_eq!((pistol.rounds, pistol.reserve), (pistol.def.magazine, pistol.def.magazine * 3));
+        assert!(pistol.rounds <= pistol.def.magazine && pistol.reserve <= pistol.def.reserve);
+    }
+
+    #[test]
+    fn a_checkpoint_never_gives_more_than_a_gun_can_carry() {
+        let mut guns = vec![Gun::new(weapons::pistol())];
+        saved(vec![10_000]).rearm(&mut guns);
+        assert_eq!(guns[0].reserve, guns[0].def.reserve);
+    }
 }

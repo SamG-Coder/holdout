@@ -3,7 +3,6 @@ name = "levelc"
 description = "Compiles a HOLDOUT level description into a Solstice scene file."
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 
 [dependencies]
 solstice-anim.workspace = true

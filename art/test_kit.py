@@ -4,7 +4,6 @@ export, bake and render. Not part of the game.
     blender --background --factory-startup --python art/test_kit.py
 """
 
-import math
 import os
 import sys
 
@@ -12,7 +11,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from lib import bl  # noqa: E402
-from mathutils import Matrix  # noqa: E402
 
 
 def main():

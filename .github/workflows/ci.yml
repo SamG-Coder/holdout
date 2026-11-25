@@ -1,0 +1,50 @@
+name: CI
+
+# The tests and lints: on every pull request, and from the Pages workflow before it deploys.
+#
+# The Rust is checked for both builds of the game: the desktop one, which the tests run in,
+# and the browser's, which compiles different code. The art scripts and tools are linted with
+# ruff; they run in Blender, so nothing here runs them.
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Fetch the engine
+        run: bash tools/setup-engine.sh
+
+      - uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0  # 1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Lint
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy -p holdout --lib --target wasm32-unknown-unknown --locked -- -D warnings
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Lint
+        run: pipx run ruff==0.17.6 check art tools

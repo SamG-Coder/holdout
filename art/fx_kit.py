@@ -7,7 +7,6 @@ metre long along the engine's Z, to be stretched to length; decals lie flat, fac
 laid on whatever was hit.
 """
 
-import math
 import os
 import sys
 

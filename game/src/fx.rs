@@ -645,28 +645,20 @@ impl Fx {
         self.shake((1.0 - distance / 30.0).clamp(0.0, 1.0));
     }
 
-    /// Starts something smouldering, for good: a wreck, a house.
-    pub fn smoulder(&mut self, renderer: &mut Renderer, position: Vec3, heat: f32) {
-        if let Some(effect) = &self.smoulder {
-            if let Some(id) = renderer
-                .particles()
-                .spawn(effect, Mat4::from_translation(position))
-            {
-                renderer.particles().set(id, "heat", heat);
-            }
-        }
+    /// Starts something smouldering, for good: a wreck, a house. Returns the effect, to put out.
+    pub fn smoulder(&mut self, renderer: &mut Renderer, position: Vec3, heat: f32) -> Option<EffectId> {
+        let effect = self.smoulder.as_ref()?;
+        let id = renderer.particles().spawn(effect, Mat4::from_translation(position))?;
+        renderer.particles().set(id, "heat", heat);
+        Some(id)
     }
 
-    /// Lights a fire, for good: `heat` 1 fills an oil drum.
-    pub fn fire(&mut self, renderer: &mut Renderer, position: Vec3, heat: f32) {
-        if let Some(effect) = &self.fire {
-            if let Some(id) = renderer
-                .particles()
-                .spawn(effect, Mat4::from_translation(position))
-            {
-                renderer.particles().set(id, "heat", heat);
-            }
-        }
+    /// Lights a fire, for good: `heat` 1 fills an oil drum. Returns the effect, to put out.
+    pub fn fire(&mut self, renderer: &mut Renderer, position: Vec3, heat: f32) -> Option<EffectId> {
+        let effect = self.fire.as_ref()?;
+        let id = renderer.particles().spawn(effect, Mat4::from_translation(position))?;
+        renderer.particles().set(id, "heat", heat);
+        Some(id)
     }
 
     /// Raises a column of smoke on the skyline, for good.

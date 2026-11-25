@@ -138,6 +138,8 @@ served from another:
      That is not a branch, so cloning the repository does not fetch it, but
      `raw.githubusercontent.com` serves it with HTTP Range and CORS, which is what streaming
      needs. A scene already hosted is only checked.
+   - **check** runs [the tests and lints](.github/workflows/ci.yml), which also run on every
+     pull request. Nothing deploys unless they pass.
    - **build** and **deploy** compile the game against the engine at the commit
      [`engine.txt`](engine.txt) names, and put it on **GitHub Pages** with a one-line note of
      where its level is.
@@ -159,6 +161,12 @@ bash tools/setup-engine.sh
 gh release download --pattern '*.solstice' --dir build/levels
 bash tools/build-web.sh
 python engine/scripts/serve.py --directory dist --port 8765     # http://localhost:8765
+
+# The tests and lints CI runs
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p holdout --lib --target wasm32-unknown-unknown -- -D warnings
+ruff check art tools
 ```
 
 <details>
