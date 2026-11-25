@@ -62,6 +62,17 @@ pub enum State {
     Complete,
 }
 
+impl State {
+    /// Its name, as the interface knows it.
+    pub fn name(self) -> &'static str {
+        match self {
+            State::Playing => "playing",
+            State::Dead => "dead",
+            State::Complete => "complete",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Line {
     pub speaker: &'static str,
@@ -91,8 +102,9 @@ pub struct Mission {
     pub checkpoint: usize,
     /// Seconds since the mission ended or the player died, for the screens that follow.
     pub ended_for: f32,
-    /// Groups already brought into play, so that returning to a checkpoint doesn't double them.
-    pub spawned: HashSet<&'static str>,
+    /// Groups already brought into play, with the stage that brought each, so that returning to
+    /// a checkpoint neither doubles them nor leaves behind those brought in after it.
+    spawned: HashMap<&'static str, usize>,
 }
 
 impl Mission {
@@ -112,7 +124,7 @@ impl Mission {
             goals,
             checkpoint: 0,
             ended_for: 0.0,
-            spawned: HashSet::new(),
+            spawned: HashMap::new(),
         };
         mission.enter(0);
         mission
@@ -149,28 +161,41 @@ impl Mission {
         self.goals.get(name).copied()
     }
 
-    /// Goes back to the last checkpoint, as after a death.
-    pub fn retry(&mut self) {
+    /// Goes back to the last checkpoint, as after a death. Returns the groups brought in after
+    /// it, which the game is to take out of play: their stages will bring them in afresh.
+    pub fn retry(&mut self) -> Vec<&'static str> {
         self.state = State::Playing;
         self.ended_for = 0.0;
         self.waiting.clear();
         self.lines.clear();
         let stage = self.checkpoint;
+        let mut withdrawn: Vec<&'static str> = self
+            .spawned
+            .iter()
+            .filter(|&(_, &at)| at > stage)
+            .map(|(&group, _)| group)
+            .collect();
+        withdrawn.sort_unstable();
+        for group in &withdrawn {
+            self.spawned.remove(group);
+        }
         // What that stage began with happens again, but nobody is brought in twice.
         self.enter(stage);
         let spawned = &self.spawned;
         self.waiting
-            .retain(|(_, action)| !matches!(action, Do::Spawn(group) if spawned.contains(group)));
+            .retain(|(_, action)| !matches!(action, Do::Spawn(group) if spawned.contains_key(group)));
+        withdrawn
     }
 
     /// Moves the mission on, and returns what it wants done now.
     pub fn update(&mut self, facts: &Facts<'_>, dt: f32) -> Vec<Do> {
-        for line in &mut self.lines {
+        // One line at a time is on the radio; the rest wait their turn, their time not yet
+        // begun.
+        if let Some(line) = self.lines.front_mut() {
             line.left -= dt;
-        }
-        // One line at a time is on the radio; the rest wait their turn.
-        while self.lines.front().is_some_and(|line| line.left <= 0.0) {
-            self.lines.pop_front();
+            if line.left <= 0.0 {
+                self.lines.pop_front();
+            }
         }
         if self.state != State::Playing {
             self.ended_for += dt;
@@ -192,8 +217,6 @@ impl Mission {
                     Do::Say(speaker, text) => {
                         // Long enough to read: a little for each word.
                         let words = text.split_whitespace().count() as f32;
-                        let queued: f32 = self.lines.iter().map(|line| line.left.max(0.0)).sum();
-                        let _ = queued;
                         self.lines.push_back(Line {
                             speaker,
                             text,
@@ -207,8 +230,10 @@ impl Mission {
                         self.ended_for = 0.0;
                     }
                     Do::Spawn(group) => {
-                        self.spawned.insert(group);
-                        out.push(Do::Spawn(group));
+                        if !self.spawned.contains_key(group) {
+                            self.spawned.insert(group, self.stage);
+                            out.push(Do::Spawn(group));
+                        }
                     }
                     other => out.push(other),
                 }
@@ -458,5 +483,71 @@ mod tests {
         // The guards were brought in before the checkpoint: they are not brought in again.
         let did = mission.update(&facts(true), 0.1);
         assert!(!did.contains(&Do::Spawn("guards")), "{did:?}");
+    }
+
+    fn run(mission: &mut Mission, at: Vec3, alive: &HashMap<String, u32>, seconds: f32) -> Vec<Do> {
+        let used = HashSet::new();
+        let facts = Facts {
+            player: at,
+            player_alive: true,
+            alive,
+            used: &used,
+        };
+        mission.update(&facts, seconds)
+    }
+
+    #[test]
+    fn a_retry_withdraws_groups_brought_in_after_the_checkpoint_and_brings_them_again() {
+        let stages = vec![
+            Stage {
+                objective: "Go to the door",
+                goal: Some("door"),
+                begin: vec![(0.0, Do::Checkpoint), (0.0, Do::Spawn("guards"))],
+                until: Until::Reach("door", 2.0),
+            },
+            Stage {
+                objective: "Hold",
+                goal: None,
+                begin: vec![(0.0, Do::Spawn("reinforcements"))],
+                until: Until::Seconds(f32::MAX),
+            },
+        ];
+        let mut mission = Mission::new("T", stages, &level());
+        let alive = HashMap::new();
+        let door = Vec3::new(10.0, 0.0, 0.0);
+        assert_eq!(run(&mut mission, door, &alive, 0.1), vec![Do::Spawn("guards")]);
+        assert_eq!(run(&mut mission, door, &alive, 0.1), vec![Do::Spawn("reinforcements")]);
+        assert_eq!(mission.retry(), vec!["reinforcements"]);
+        assert_eq!(mission.stage, 0);
+        // Back at the door, the stage after brings its group in once more; the guards, from
+        // before the checkpoint, stay as they are.
+        assert_eq!(run(&mut mission, Vec3::ZERO, &alive, 0.1), Vec::<Do>::new());
+        assert_eq!(run(&mut mission, door, &alive, 0.1), Vec::<Do>::new());
+        assert_eq!(run(&mut mission, door, &alive, 0.1), vec![Do::Spawn("reinforcements")]);
+        assert_eq!(mission.retry(), vec!["reinforcements"], "nothing is brought in twice");
+    }
+
+    #[test]
+    fn a_line_waiting_its_turn_keeps_all_its_time() {
+        let stages = vec![Stage {
+            objective: "",
+            goal: None,
+            begin: vec![(0.0, Do::Say("A", "one two three four")), (0.0, Do::Say("B", "five"))],
+            until: Until::Seconds(f32::MAX),
+        }];
+        let mut mission = Mission::new("T", stages, &level());
+        let alive = HashMap::new();
+        run(&mut mission, Vec3::ZERO, &alive, 0.1);
+        let second = mission.lines[1].left;
+        // The first line's whole time passes, a little at a time.
+        let first = mission.lines[0].left;
+        let mut passed = 0.0;
+        while passed < first {
+            run(&mut mission, Vec3::ZERO, &alive, 0.1);
+            passed += 0.1;
+        }
+        assert_eq!(mission.lines.len(), 1);
+        assert_eq!(mission.lines[0].speaker, "B");
+        assert!((mission.lines[0].left - second).abs() < 1.0e-6, "the second line has not begun");
     }
 }

@@ -113,6 +113,9 @@ pub struct WeaponDef {
     pub loudness: f32,
 }
 
+/// The carbine's place in the arsenal: every level starts the player with it.
+pub const CARBINE: usize = 0;
+
 pub fn carbine() -> WeaponDef {
     WeaponDef {
         name: "carbine",
@@ -155,6 +158,8 @@ pub fn carbine() -> WeaponDef {
         hold: RifleHold {
             grip: Vec3::new(0.0, -0.062, 0.036),
             support: Vec3::new(0.0, -0.008, -0.235),
+            // A length in metres, measured off the model: not 1/π.
+            #[expect(clippy::approx_constant)]
             butt: Vec3::new(0.0, 0.004, 0.318),
             muzzle: Vec3::new(0.0, 0.035, -0.505),
             support_fingers: crate::anim::UNDER_FINGERS,
@@ -425,9 +430,12 @@ impl Arsenal {
         self.phase == Phase::Ready && self.sprint < 0.4
     }
 
-    /// Takes rounds for the current weapon. Returns how many were taken.
-    pub fn add_rounds(&mut self, rounds: u32) -> u32 {
-        let gun = &mut self.guns[self.current];
+    /// Takes rounds for one of the weapons, by its place in the arsenal. Returns how many were
+    /// taken: none for a weapon the player doesn't have.
+    pub fn add_rounds_to(&mut self, index: usize, rounds: u32) -> u32 {
+        let Some(gun) = self.guns.get_mut(index) else {
+            return 0;
+        };
         let room = gun.def.reserve.saturating_sub(gun.reserve);
         let taken = rounds.min(room);
         gun.reserve += taken;

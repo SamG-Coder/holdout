@@ -255,7 +255,7 @@ impl WebGame {
                 (view.camera, view.environment)
             }
             Some(game) => {
-                let view = game.still(&mut self.renderer);
+                let view = game.still();
                 self.input.end_frame();
                 (view.camera, view.environment)
             }

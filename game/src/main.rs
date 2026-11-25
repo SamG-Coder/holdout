@@ -216,12 +216,10 @@ mod native {
             Some("mouse") => input.mouse_motion(number(1), number(2)),
             Some("shot") => return words.get(1).map(PathBuf::from),
             Some("time") => game.set_time(number(1)),
-            Some(_) => {
-                if !game.debug_command(command) {
-                    log::warn!("script: unknown command '{command}'");
-                }
+            Some(_) if !game.debug_command(command) => {
+                log::warn!("script: unknown command '{command}'");
             }
-            None => {}
+            Some(_) | None => {}
         }
         None
     }

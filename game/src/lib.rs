@@ -39,7 +39,7 @@ use solstice_asset::scene::Viewpoint;
 use solstice_asset::{Clip, Collision, GameFile, Skeleton};
 use solstice_render::{Camera, Environment, Place, Renderer, TimeOfDay, Weather};
 use mission::{Mission, State};
-use play::{Grenade, Saved};
+use play::{Aftermath, Grenade, Saved};
 use std::collections::{HashMap, HashSet};
 use weapons::{Arsenal, Gun, Shot};
 
@@ -146,6 +146,8 @@ pub struct Game {
     swaps: HashMap<String, (Vec<Group>, Vec<Group>)>,
     /// Explosions set to follow one that has gone off: how long until each, and where.
     blasts: Vec<(f32, Vec3)>,
+    /// What the mission has done to the level so far, in order, for a retry to undo.
+    aftermath: Vec<Aftermath>,
     /// Rounds just picked up, and how much longer the interface says so.
     picked_up: Option<(u32, f32)>,
     /// What the player has done, for the end of the mission.
@@ -186,25 +188,7 @@ impl Game {
             .ok_or_else(|| format!("the scene has no {LEVEL_FILE}: was it made by levelc?"))?;
         let level = Level::parse(text)?;
 
-        let mut physics = Physics::new();
-        if let Some(collision) = info.collision {
-            physics.add_scene(collision, |index| renderer.instance_transform(index));
-        }
-        for blocker in &level.blockers {
-            match blocker.surface {
-                Some(surface) => {
-                    physics.add_solid(blocker.centre, blocker.size, blocker.yaw, surface.solid_id());
-                }
-                None => physics.add_edge(blocker.centre, blocker.size, blocker.yaw),
-            }
-        }
-        for trunk in &level.trunks {
-            physics.add_trunk(trunk.position, trunk.radius, 6.0);
-        }
-        for warning in physics.warnings.drain(..) {
-            log::warn!("physics: {warning}");
-        }
-
+        let mut physics = build_physics(&level, info, renderer);
         let (feet, yaw) = match level.marker("player", "start") {
             Some(marker) => (marker.position, marker.yaw),
             None => {
@@ -218,84 +202,13 @@ impl Game {
         // Once, so that rays and walkers see everything just added.
         physics.step(1.0 / 60.0);
 
-        // Characters: each skinned kit is a rig, and each placement of it a body.
-        let mut rigs = Vec::new();
-        let mut rig_names = HashMap::new();
-        let mut kits: Vec<(&String, &u32)> = level.skeletons.iter().collect();
-        kits.sort();
-        for (alias, skeleton) in kits {
-            rig_names.insert(alias.clone(), rigs.len());
-            rigs.push(Rig::new(alias, *skeleton, info.skeletons, info.clips)?);
-        }
-        let mut npcs = Vec::new();
-        let mut rifles = Group::all(&level, "npc_rifle", renderer).into_iter();
-        let mut names: Vec<(&String, &usize)> = rig_names.iter().collect();
-        names.sort();
-        for (alias, &rig_index) in names {
-            if alias == "arms" {
-                continue;
-            }
-            for mut body in Group::all(&level, alias, renderer) {
-                body.set_hidden(renderer, true);
-                let mut rifle = rifles.next();
-                if let Some(rifle) = &mut rifle {
-                    rifle.set_hidden(renderer, true);
-                }
-                npcs.push(Npc::new(body, rifle, rig_index, &rigs[rig_index], alias));
-            }
-        }
-
-        // Where people can walk: sounded between the level's corners, or round its markers.
-        let seeds: Vec<Vec3> = level.markers.iter().map(|m| m.position + Vec3::Y * 0.3).collect();
-        let nav = if seeds.is_empty() {
-            None
-        } else {
-            let words: Vec<f32> = level
-                .setting("nav")
-                .map(|text| text.split_whitespace().filter_map(|w| w.parse().ok()).collect())
-                .unwrap_or_default();
-            let (mut low, mut high) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            for seed in &seeds {
-                low = low.min(*seed);
-                high = high.max(*seed);
-            }
-            let (low, high) = if words.len() == 4 {
-                (
-                    Vec3::new(words[0], low.y - 3.0, words[1]),
-                    Vec3::new(words[2], high.y + 7.0, words[3]),
-                )
-            } else {
-                (low - Vec3::new(25.0, 3.0, 25.0), high + Vec3::new(25.0, 7.0, 25.0))
-            };
-            let nav = Nav::build(&physics, low, high, &seeds);
-            log::info!("navigation: {} places, {} pieces of cover", nav.place_count(), nav.covers.len());
-            Some(nav)
-        };
+        let People { rigs, rig_names, npcs } = load_people(&level, info, renderer)?;
+        let nav = build_nav(&level, &physics);
         let cover_owner = vec![None; nav.as_ref().map_or(0, |nav| nav.covers.len())];
 
         let fx = Fx::new(&level, renderer);
-        // The sidearm, in levels made since there was one.
-        let mut guns = vec![Gun::new(weapons::carbine())];
-        if level.one("fp_pistol_body").is_some() {
-            guns.push(Gun::new(weapons::pistol()));
-        }
-        let arsenal = Arsenal::new(
-            &level,
-            renderer,
-            guns,
-            rig_names.get("arms").copied(),
-        );
-        // The sight's dot and tracers glow far brighter than a material can say.
-        for placed in level.all("fp_carbine_dot") {
-            for id in placed.instances() {
-                renderer.set_instance_glow(id, 60.0);
-            }
-        }
-        for placed in level.all("tracer") {
-            for id in placed.instances() {
-                renderer.set_instance_glow(id, 90.0);
-            }
-        }
+        let arsenal = Arsenal::new(&level, renderer, guns_for(&level), rig_names.get("arms").copied());
+        set_glows(&level, renderer);
 
         let mission = mission::by_name(level.setting("mission").unwrap_or(""), &level);
         let pickups: Vec<(Vec3, bool, u32)> = level
@@ -303,41 +216,15 @@ impl Game {
             .map(|marker| (marker.position, false, marker.number("rounds", 60.0) as u32))
             .collect();
         let pickup_groups = Group::all(&level, "pickup", renderer);
-        // Wrecks wait out of sight for the explosion that makes them.
-        let mut swaps: HashMap<String, (Vec<Group>, Vec<Group>)> = HashMap::new();
-        let wrecked: Vec<String> = level
-            .placed
-            .keys()
-            .filter_map(|tag| tag.strip_suffix("_wreck").map(str::to_owned))
-            .collect();
-        for name in wrecked {
-            let whole = Group::all(&level, &format!("{name}_intact"), renderer);
-            let mut wreck = Group::all(&level, &format!("{name}_wreck"), renderer);
-            for group in &mut wreck {
-                group.set_hidden(renderer, true);
-            }
-            swaps.insert(name, (whole, wreck));
-        }
-        let mut grenade_pool = Group::all(&level, "grenade", renderer);
-        for group in &mut grenade_pool {
-            group.set_hidden(renderer, true);
-        }
-
-        let time = TimeOfDay {
-            day: level.setting_number("day", 265.0),
-            hours: level.setting_number("time", 17.4),
-        };
-        let place = Place {
-            latitude: level.setting_number("latitude", 44.0),
-            north: -level.setting_number("north", 0.0).to_radians(),
-        };
-        if let Some(weather) = level.setting("weather").and_then(Weather::by_name) {
-            renderer.set_weather(weather, 0.0);
-        }
-        let day_seconds = level.setting_number("day_seconds", 0.0);
-        let time_stop = level.setting_number("time_stop", 24.0);
-        let level_exposure = level.setting_number("exposure", 1.0).max(0.05);
+        let swaps = load_swaps(&level, renderer);
+        let grenade_pool = hidden_groups(&level, "grenade", renderer);
+        let (time, place) = set_the_sky(&level, renderer);
+        let fov = 62.0_f32.to_radians();
+        let last_view = first_view(&player, &time, &place, fov);
         let mut game = Self {
+            day_seconds: level.setting_number("day_seconds", 0.0),
+            time_stop: level.setting_number("time_stop", 24.0),
+            exposure: level.setting_number("exposure", 1.0).max(0.05),
             level,
             physics,
             player,
@@ -347,15 +234,12 @@ impl Game {
             time,
             place,
             daylight: daylight(),
-            day_seconds,
-            time_stop,
-            exposure: level_exposure,
             low_sun: 1.0,
             fly: None,
             wanted_weather: None,
             wanted_retry: false,
             god: false,
-            fov: 62.0_f32.to_radians(),
+            fov,
             elapsed: 0.0,
             frames: 0,
             title_time: 0.0,
@@ -382,56 +266,44 @@ impl Game {
             grenade_pool,
             swaps,
             blasts: Vec::new(),
+            aftermath: Vec::new(),
             picked_up: None,
             tally: Tally::default(),
             grenades_left: 2,
             saved: None,
             saved_stage: usize::MAX,
-            last_view: View {
-                camera: Camera::default(),
-                environment: daylight(),
-            },
+            last_view,
         };
-        // Until the first frame, the view is the player's own, standing where they start.
-        game.last_view = View {
-            camera: Camera {
-                position: game.player.eye(),
-                yaw: game.player.yaw,
-                pitch: 0.0,
-                fov_y: game.fov,
-                near: 0.05,
-            },
-            environment: game.time.environment(&game.place, &game.daylight),
-        };
-        // Fires that burn from the start: `fire` markers, with how hot.
-        let fires: Vec<(Vec3, f32)> = game
-            .level
-            .markers_of("fire")
-            .map(|marker| (marker.position, marker.number("heat", 1.0)))
-            .collect();
+        game.light_fires(renderer);
+        game.place_people(renderer);
+        Ok(game)
+    }
+
+    /// Lights what burns from the start: `fire` markers in the town, `plume` markers beyond it.
+    fn light_fires(&mut self, renderer: &mut Renderer) {
+        let heat = |marker: &level::Marker| (marker.position, marker.number("heat", 1.0));
+        let fires: Vec<(Vec3, f32)> = self.level.markers_of("fire").map(heat).collect();
+        let plumes: Vec<(Vec3, f32)> = self.level.markers_of("plume").map(heat).collect();
         for (at, heat) in fires {
-            game.fx.fire(renderer, at, heat);
+            self.fx.fire(renderer, at, heat);
         }
-        // And what burns beyond the town: `plume` markers.
-        let plumes: Vec<(Vec3, f32)> = game
-            .level
-            .markers_of("plume")
-            .map(|marker| (marker.position, marker.number("heat", 1.0)))
-            .collect();
         for (at, heat) in plumes {
-            game.fx.plume(renderer, at, heat);
+            self.fx.plume(renderer, at, heat);
         }
-        // Until a mission places them: someone stands at each `npc` marker, as it says.
-        let markers: Vec<_> = game.level.markers_of("npc").cloned().collect();
+    }
+
+    /// Until a mission places them: someone stands at each `npc` marker, as it says.
+    fn place_people(&mut self, renderer: &mut Renderer) {
+        let markers: Vec<_> = self.level.markers_of("npc").cloned().collect();
         for marker in &markers {
             let kind = marker.option("kind").unwrap_or("soldier").to_owned();
             let team = if kind.starts_with("rebel") { Team::Resistance } else { Team::Directorate };
             let thinking = marker.number("ai", 0.0) > 0.5;
-            let Some(index) = game.spawn(renderer, &kind, marker.position, marker.yaw, team, thinking) else {
+            let Some(index) = self.spawn(renderer, &kind, marker.position, marker.yaw, team, thinking) else {
                 log::warn!("no {kind} left for the npc marker `{}`", marker.name);
                 continue;
             };
-            let npc = &mut game.npcs[index];
+            let npc = &mut self.npcs[index];
             npc.speed = marker.number("speed", 0.0);
             npc.crouched = marker.number("crouch", 0.0) > 0.5;
             npc.stance.aim_yaw = marker.number("aim_yaw", 0.0).to_radians();
@@ -443,7 +315,6 @@ impl Game {
                 npc.animator.play(action, 0.0, 0.0, 1.0, true);
             }
         }
-        Ok(game)
     }
 
     /// Brings someone of a kind into play at a place. Returns which, or `None` if every body of
@@ -482,6 +353,15 @@ impl Game {
         npc.enter(renderer, &mut self.physics, rig, position, yaw, team, thinking, seed);
         npc.brain.slot = followers;
         Some(index)
+    }
+
+    /// Lets go of whatever cover one person holds, for the others to take.
+    fn release_cover(&mut self, npc: usize) {
+        for owner in &mut self.cover_owner {
+            if *owner == Some(npc) {
+                *owner = None;
+            }
+        }
     }
 
     pub fn set_time(&mut self, hours: f32) {
@@ -681,33 +561,16 @@ impl Game {
         let dt = seconds.clamp(1.0 / 500.0, 1.0 / 20.0);
         self.elapsed += dt;
         self.frames += 1;
-        if std::mem::take(&mut self.wanted_retry) {
-            self.restart(renderer);
-        }
-        if let Some((name, over)) = self.wanted_weather.take() {
-            match Weather::by_name(&name) {
-                Some(weather) => renderer.set_weather(weather, over),
-                None => log::warn!("no weather called {name}"),
-            }
-        }
-
+        self.take_console_requests(renderer);
         if input.take(Action::Fly) {
-            self.fly = match self.fly.take() {
-                Some(_) => None,
-                None => Some(FlyCamera {
-                    position: self.player.eye(),
-                    yaw: self.player.yaw,
-                    pitch: self.player.pitch,
-                    velocity: Vec3::ZERO,
-                }),
-            };
+            self.toggle_fly();
         }
         if self.scripted_fire > 0 {
             self.scripted_fire -= 1;
             input.set(Action::Fire, self.scripted_fire > 0);
         }
 
-        let (turn_left, turn_up) = input.turn(dt);
+        let turn = input.turn(dt);
         let over = self.mission.state != State::Playing;
         if !over {
             self.tally.seconds += dt;
@@ -720,32 +583,9 @@ impl Game {
         if !flying {
             // Aimed, the same push of the mouse turns the view less, as the zoom would magnify it.
             let aimed = 1.0 - self.arsenal.aim * (1.0 - self.arsenal.gun().def.aim_zoom);
-            self.player.turn(turn_left * aimed, turn_up * aimed);
+            self.player.turn(turn.0 * aimed, turn.1 * aimed);
         }
-        let aiming = self.arsenal.aim > 0.5;
-        let body = self
-            .player
-            .update(&mut self.physics, body_input, dt, aiming, flying);
-        if let Some(weight) = body.footstep {
-            let under = self
-                .physics
-                .raycast(self.player.feet + Vec3::Y * 0.3, Vec3::NEG_Y, 1.0, WORLD);
-            let surface = self.level.surface_of(under.and_then(|hit| hit.instance));
-            let sound = match surface {
-                Surface::Grass | Surface::Dirt => "step_dirt",
-                Surface::Wood => "step_wood",
-                Surface::Metal => "step_metal",
-                _ => "step_concrete",
-            };
-            self.audio.own(sound, 0.35 + weight * 0.5);
-        }
-        if body.jumped {
-            self.audio.own("jump", 0.6);
-        }
-        if let Some(speed) = body.landed {
-            self.audio.own("land", (speed / 8.0).clamp(0.3, 1.0));
-            self.fx.shake((speed / 30.0).min(0.3));
-        }
+        self.move_body(body_input, dt, flying);
 
         let shots = self.arsenal.update(
             renderer,
@@ -765,11 +605,105 @@ impl Game {
                 team: Team::Resistance,
             });
         }
+        self.run_people(!shots.is_empty(), dt);
+        self.update_mission(renderer, dt, use_held, throw);
+        self.tend_the_dead(dt);
+        for landed in std::mem::take(&mut self.fx.casing_landed) {
+            self.audio.at("casing", landed, 0.5);
+        }
 
-        // Everyone else.
+        // The view: the player's eye, thrown about by recoil and whatever shakes it.
+        let punch = self.arsenal.view_punch();
+        let shake = self.fx.view_shake();
+        let eye = Eye {
+            position: self.player.eye(),
+            yaw: self.player.yaw + (punch.x + shake.x) * 0.02,
+            pitch: (self.player.pitch + punch.y * 0.02 + shake.y).clamp(-1.55, 1.55),
+            roll: punch.z * 0.02 + shake.z,
+        };
+        let player_view = camera_matrix(eye.position, eye.yaw, eye.pitch, eye.roll);
+        self.arsenal.draw(renderer, &self.rigs, &self.player, &self.physics, player_view, turn, dt, flying);
+        let camera = if self.fly.is_some() {
+            self.fly_camera(renderer, input, turn, dt)
+        } else {
+            self.eye_camera(renderer, eye)
+        };
+
+        for npc in &mut self.npcs {
+            if npc.active {
+                npc.draw(renderer, &self.rigs[npc.rig], &self.hold, dt, camera.position);
+            }
+        }
+        self.fx.update(renderer, dt);
+        self.physics.step(dt);
+        input.end_frame();
+
+        self.audio.listener = camera.position;
+        self.audio.listener_forward = camera.forward();
+        self.last_view = View {
+            camera,
+            environment: self.environment(dt),
+        };
+        self.last_view
+    }
+
+    /// Carries out what the console asked for since the last frame.
+    fn take_console_requests(&mut self, renderer: &mut Renderer) {
+        if std::mem::take(&mut self.wanted_retry) {
+            self.restart(renderer);
+        }
+        if let Some((name, over)) = self.wanted_weather.take() {
+            match Weather::by_name(&name) {
+                Some(weather) => renderer.set_weather(weather, over),
+                None => log::warn!("no weather called {name}"),
+            }
+        }
+    }
+
+    /// Takes the camera out of the body to fly freely, or puts it back.
+    fn toggle_fly(&mut self) {
+        self.fly = match self.fly.take() {
+            Some(_) => None,
+            None => Some(FlyCamera {
+                position: self.player.eye(),
+                yaw: self.player.yaw,
+                pitch: self.player.pitch,
+                velocity: Vec3::ZERO,
+            }),
+        };
+    }
+
+    /// Moves the player's body, and plays what that sounds like.
+    fn move_body(&mut self, input: &Input, dt: f32, flying: bool) {
+        let aiming = self.arsenal.aim > 0.5;
+        let body = self.player.update(&mut self.physics, input, dt, aiming, flying);
+        if let Some(weight) = body.footstep {
+            let under = self
+                .physics
+                .raycast(self.player.feet + Vec3::Y * 0.3, Vec3::NEG_Y, 1.0, WORLD);
+            let sound = match self.level.surface_of(under.and_then(|hit| hit.instance)) {
+                Surface::Grass | Surface::Dirt => "step_dirt",
+                Surface::Wood => "step_wood",
+                Surface::Metal => "step_metal",
+                _ => "step_concrete",
+            };
+            self.audio.own(sound, 0.35 + weight * 0.5);
+        }
+        if body.jumped {
+            self.audio.own("jump", 0.6);
+        }
+        if let Some(speed) = body.landed {
+            self.audio.own("land", (speed / 8.0).clamp(0.3, 1.0));
+            self.fx.shake((speed / 30.0).min(0.3));
+        }
+    }
+
+    /// Everyone else's frame, and what they did to the player.
+    fn run_people(&mut self, player_firing: bool, dt: f32) {
         let noises = std::mem::take(&mut self.noises);
-        let ai_time = prof::scope("ai");
-        let harm = ai::update(
+        let harm = {
+            let _ai_time = prof::scope("ai");
+            ai::update(
             &mut ai::World {
                 npcs: &mut self.npcs,
                 rigs: &self.rigs,
@@ -781,12 +715,12 @@ impl Game {
                 audio: &mut self.audio,
                 noises: &noises,
                 cover_owner: &mut self.cover_owner,
-                player_firing: !shots.is_empty(),
+                player_firing,
                 time: self.elapsed,
             },
             dt,
-        );
-        drop(ai_time);
+            )
+        };
         self.since_hurt += dt;
         self.hurt_flash = (self.hurt_flash - dt * 1.6).max(0.0);
         for (damage, from) in &harm.hits {
@@ -802,97 +736,74 @@ impl Game {
         if self.player.alive && self.since_hurt > 4.5 {
             self.player.health = (self.player.health + dt * 22.0).min(100.0);
         }
-        self.update_mission(renderer, dt, use_held, throw);
-        for npc in &mut self.npcs {
+    }
+
+    /// The dead lie longer, and as they fall, no longer hold their cover or block the way.
+    fn tend_the_dead(&mut self, dt: f32) {
+        for index in 0..self.npcs.len() {
+            let npc = &mut self.npcs[index];
             if npc.active && !npc.alive {
                 npc.dead_for += dt;
-                // The dead no longer hold their cover or block the way.
                 if npc.dead_for < dt * 1.5 {
                     if let Some(walker) = npc.walker {
                         self.physics.set_walker_enabled(walker, false);
                     }
-                    for owner in &mut self.cover_owner {
-                        *owner = None;
-                    }
+                    self.release_cover(index);
                 }
             }
         }
-        for landed in std::mem::take(&mut self.fx.casing_landed) {
-            self.audio.at("casing", landed, 0.5);
+    }
+
+    /// The camera flown freely, steered as the body would be.
+    fn fly_camera(&mut self, renderer: &mut Renderer, input: &Input, turn: (f32, f32), dt: f32) -> Camera {
+        let fov = self.fov;
+        let Some(fly) = self.fly.as_mut() else {
+            return self.last_view.camera;
+        };
+        fly.yaw += turn.0;
+        fly.pitch = (fly.pitch + turn.1).clamp(-1.5, 1.5);
+        let (sy, cy) = fly.yaw.sin_cos();
+        let (sp, cp) = fly.pitch.sin_cos();
+        let forward = Vec3::new(-sy * cp, sp, -cy * cp);
+        let right = Vec3::new(cy, 0.0, -sy);
+        let (push_right, push_forward) = input.movement();
+        let up = f32::from(u8::from(input.held(Action::FlyUp) || input.held(Action::Jump)))
+            - f32::from(u8::from(input.held(Action::FlyDown) || input.held(Action::Crouch)));
+        let speed = if input.held(Action::Sprint) { 40.0 } else { 8.0 };
+        let wanted = (forward * push_forward + right * push_right + Vec3::Y * up) * speed;
+        fly.velocity += (wanted - fly.velocity) * (1.0 - (-dt * 10.0).exp());
+        fly.position += fly.velocity * dt;
+        renderer.settings_mut().camera_roll = 0.0;
+        Camera {
+            position: fly.position,
+            yaw: fly.yaw,
+            pitch: fly.pitch,
+            fov_y: fov,
+            near: 0.05,
         }
+    }
 
-        // The view: the player's eye, thrown about by recoil and whatever shakes it.
-        let punch = self.arsenal.view_punch();
-        let shake = self.fx.view_shake();
-        let eye = self.player.eye();
-        let yaw = self.player.yaw + (punch.x + shake.x) * 0.02;
-        let pitch = (self.player.pitch + punch.y * 0.02 + shake.y).clamp(-1.55, 1.55);
-        let roll = punch.z * 0.02 + shake.z;
-        let player_view = camera_matrix(eye, yaw, pitch, roll);
-        self.arsenal.draw(
-            renderer,
-            &self.rigs,
-            &self.player,
-            &self.physics,
-            player_view,
-            (turn_left, turn_up),
-            dt,
-            flying,
-        );
-
-        // Dead, the view sinks and tips over with the body.
-        let (eye, pitch, roll) = if self.player.alive {
-            (eye, pitch, roll)
-        } else {
+    /// The camera at the player's eye. Dead, the view sinks and tips over with the body.
+    fn eye_camera(&mut self, renderer: &mut Renderer, eye: Eye) -> Camera {
+        let Eye { mut position, yaw, mut pitch, mut roll } = eye;
+        if !self.player.alive {
             let fallen = (self.mission.ended_for * 1.6).min(1.0);
-            (eye - Vec3::Y * 0.25 * fallen, pitch - 0.3 * fallen, roll + 0.55 * fallen)
-        };
-        let camera = if let Some(fly) = &mut self.fly {
-            fly.yaw += turn_left;
-            fly.pitch = (fly.pitch + turn_up).clamp(-1.5, 1.5);
-            let (sy, cy) = fly.yaw.sin_cos();
-            let (sp, cp) = fly.pitch.sin_cos();
-            let forward = Vec3::new(-sy * cp, sp, -cy * cp);
-            let right = Vec3::new(cy, 0.0, -sy);
-            let (push_right, push_forward) = input.movement();
-            let up = f32::from(u8::from(input.held(Action::FlyUp) || input.held(Action::Jump)))
-                - f32::from(u8::from(input.held(Action::FlyDown) || input.held(Action::Crouch)));
-            let speed = if input.held(Action::Sprint) { 40.0 } else { 8.0 };
-            let wanted = (forward * push_forward + right * push_right + Vec3::Y * up) * speed;
-            fly.velocity += (wanted - fly.velocity) * (1.0 - (-dt * 10.0).exp());
-            fly.position += fly.velocity * dt;
-            renderer.settings_mut().camera_roll = 0.0;
-            Camera {
-                position: fly.position,
-                yaw: fly.yaw,
-                pitch: fly.pitch,
-                fov_y: self.fov,
-                near: 0.05,
-            }
-        } else {
-            renderer.settings_mut().camera_roll = roll;
-            Camera {
-                position: eye,
-                yaw,
-                pitch,
-                fov_y: self.arsenal.fov(self.fov),
-                near: 0.03,
-            }
-        };
-
-        for npc in &mut self.npcs {
-            if !npc.active {
-                continue;
-            }
-            let rig = &self.rigs[npc.rig];
-            npc.draw(renderer, rig, &self.hold, dt, camera.position);
+            position -= Vec3::Y * 0.25 * fallen;
+            pitch -= 0.3 * fallen;
+            roll += 0.55 * fallen;
         }
-        self.fx.update(renderer, dt);
-        self.physics.step(dt);
-        input.end_frame();
+        renderer.settings_mut().camera_roll = roll;
+        Camera {
+            position,
+            yaw,
+            pitch,
+            fov_y: self.arsenal.fov(self.fov),
+            near: 0.03,
+        }
+    }
 
-        self.audio.listener = camera.position;
-        self.audio.listener_forward = camera.forward();
+    /// The light of the hour, moving the clock on by `dt`.
+    fn environment(&mut self, dt: f32) -> Environment {
         if self.day_seconds > 0.0 && self.time.hours < self.time_stop {
             self.time.advance(dt * 24.0 / self.day_seconds);
         }
@@ -909,7 +820,180 @@ impl Game {
         let keep = (direct * direct * (3.0 - 2.0 * direct)).max(self.low_sun);
         environment.sun_illuminance *= keep;
         environment.sky_intensity /= keep;
-        self.last_view = View { camera, environment };
-        self.last_view
+        environment
     }
+}
+
+/// Where the player's eye is and how it is turned, before death tips it over.
+#[derive(Clone, Copy, Debug)]
+struct Eye {
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    roll: f32,
+}
+
+/// The world's solids: the scene's collision, the level's blockers and its tree trunks.
+fn build_physics(level: &Level, info: &SceneInfo<'_>, renderer: &Renderer) -> Physics {
+    let mut physics = Physics::new();
+    if let Some(collision) = info.collision {
+        physics.add_scene(collision, |index| renderer.instance_transform(index));
+    }
+    for blocker in &level.blockers {
+        match blocker.surface {
+            Some(surface) => {
+                physics.add_solid(blocker.centre, blocker.size, blocker.yaw, surface.solid_id());
+            }
+            None => physics.add_edge(blocker.centre, blocker.size, blocker.yaw),
+        }
+    }
+    for trunk in &level.trunks {
+        physics.add_trunk(trunk.position, trunk.radius, 6.0);
+    }
+    for warning in physics.warnings.drain(..) {
+        log::warn!("physics: {warning}");
+    }
+    physics
+}
+
+/// The people of a level, and the rigs that pose them.
+struct People {
+    rigs: Vec<Rig>,
+    rig_names: HashMap<String, usize>,
+    npcs: Vec<Npc>,
+}
+
+/// The rigs, by name, and the people: each skinned kit is a rig, and each placement of it a
+/// body, hidden until it is brought into play.
+fn load_people(level: &Level, info: &SceneInfo<'_>, renderer: &mut Renderer) -> Result<People, String> {
+    let mut rigs = Vec::new();
+    let mut rig_names = HashMap::new();
+    let mut kits: Vec<(&String, &u32)> = level.skeletons.iter().collect();
+    kits.sort();
+    for (alias, skeleton) in kits {
+        rig_names.insert(alias.clone(), rigs.len());
+        rigs.push(Rig::new(alias, *skeleton, info.skeletons, info.clips)?);
+    }
+    let mut npcs = Vec::new();
+    let mut rifles = Group::all(level, "npc_rifle", renderer).into_iter();
+    let mut names: Vec<(&String, &usize)> = rig_names.iter().collect();
+    names.sort();
+    for (alias, &rig_index) in names {
+        if alias == "arms" {
+            continue;
+        }
+        for mut body in Group::all(level, alias, renderer) {
+            body.set_hidden(renderer, true);
+            let mut rifle = rifles.next();
+            if let Some(rifle) = &mut rifle {
+                rifle.set_hidden(renderer, true);
+            }
+            npcs.push(Npc::new(body, rifle, rig_index, &rigs[rig_index], alias));
+        }
+    }
+    Ok(People { rigs, rig_names, npcs })
+}
+
+/// Where people can walk: sounded between the level's corners, or round its markers.
+fn build_nav(level: &Level, physics: &Physics) -> Option<Nav> {
+    let seeds: Vec<Vec3> = level.markers.iter().map(|m| m.position + Vec3::Y * 0.3).collect();
+    if seeds.is_empty() {
+        return None;
+    }
+    let words: Vec<f32> = level
+        .setting("nav")
+        .map(|text| text.split_whitespace().filter_map(|w| w.parse().ok()).collect())
+        .unwrap_or_default();
+    let (mut low, mut high) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for seed in &seeds {
+        low = low.min(*seed);
+        high = high.max(*seed);
+    }
+    let (low, high) = if words.len() == 4 {
+        (
+            Vec3::new(words[0], low.y - 3.0, words[1]),
+            Vec3::new(words[2], high.y + 7.0, words[3]),
+        )
+    } else {
+        (low - Vec3::new(25.0, 3.0, 25.0), high + Vec3::new(25.0, 7.0, 25.0))
+    };
+    let nav = Nav::build(physics, low, high, &seeds);
+    log::info!("navigation: {} places, {} pieces of cover", nav.place_count(), nav.covers.len());
+    Some(nav)
+}
+
+/// The sight's dot and tracers glow far brighter than a material can say.
+fn set_glows(level: &Level, renderer: &mut Renderer) {
+    for (tag, glow) in [("fp_carbine_dot", 60.0), ("tracer", 90.0)] {
+        for placed in level.all(tag) {
+            for id in placed.instances() {
+                renderer.set_instance_glow(id, glow);
+            }
+        }
+    }
+}
+
+/// What a mission's explosions destroy: for each name, the thing whole and its wreck, which
+/// waits out of sight for the explosion that makes it.
+fn load_swaps(level: &Level, renderer: &mut Renderer) -> HashMap<String, (Vec<Group>, Vec<Group>)> {
+    let mut swaps = HashMap::new();
+    let wrecked: Vec<String> = level
+        .placed
+        .keys()
+        .filter_map(|tag| tag.strip_suffix("_wreck").map(str::to_owned))
+        .collect();
+    for name in wrecked {
+        let whole = Group::all(level, &format!("{name}_intact"), renderer);
+        let wreck = hidden_groups(level, &format!("{name}_wreck"), renderer);
+        swaps.insert(name, (whole, wreck));
+    }
+    swaps
+}
+
+/// Every group a level places under a tag, hidden until it is wanted.
+fn hidden_groups(level: &Level, tag: &str, renderer: &mut Renderer) -> Vec<Group> {
+    let mut groups = Group::all(level, tag, renderer);
+    for group in &mut groups {
+        group.set_hidden(renderer, true);
+    }
+    groups
+}
+
+/// The level's day, hour and place on the earth, and its weather as the game begins.
+fn set_the_sky(level: &Level, renderer: &mut Renderer) -> (TimeOfDay, Place) {
+    if let Some(weather) = level.setting("weather").and_then(Weather::by_name) {
+        renderer.set_weather(weather, 0.0);
+    }
+    let time = TimeOfDay {
+        day: level.setting_number("day", 265.0),
+        hours: level.setting_number("time", 17.4),
+    };
+    let place = Place {
+        latitude: level.setting_number("latitude", 44.0),
+        north: -level.setting_number("north", 0.0).to_radians(),
+    };
+    (time, place)
+}
+
+/// Until the first frame, the view is the player's own, standing where they start.
+fn first_view(player: &Player, time: &TimeOfDay, place: &Place, fov: f32) -> View {
+    View {
+        camera: Camera {
+            position: player.eye(),
+            yaw: player.yaw,
+            pitch: 0.0,
+            fov_y: fov,
+            near: 0.05,
+        },
+        environment: time.environment(place, &daylight()),
+    }
+}
+
+/// The carbine, and the sidearm in levels made since there was one.
+fn guns_for(level: &Level) -> Vec<Gun> {
+    let mut guns = vec![Gun::new(weapons::carbine())];
+    if level.one("fp_pistol_body").is_some() {
+        guns.push(Gun::new(weapons::pistol()));
+    }
+    guns
 }

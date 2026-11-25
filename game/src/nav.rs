@@ -175,8 +175,7 @@ impl Nav {
                 for offset in 0..u32::from(nav.column_count[index]) {
                     let place = first + offset;
                     let y = nav.places[place as usize].position.y;
-                    for way in 0..4 {
-                        let (dx, dz) = WAYS[way];
+                    for (way, &(dx, dz)) in WAYS[..4].iter().enumerate() {
                         nav.places[place as usize].links[way] = nav
                             .place_in(column as i32 + dx, row as i32 + dz, y, MAX_STEP)
                             .unwrap_or(NONE);
