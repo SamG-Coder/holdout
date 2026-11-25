@@ -619,10 +619,10 @@ class TextureSet:
 
     def preview(self, light=(0.5, 0.6, 0.62)):
         """A quick lit picture of the material, for a contact sheet: sRGB-ready linear colour."""
-        l = np.asarray(light, dtype=F)
-        l = l / np.linalg.norm(l)
-        ndl = saturate(self.normal @ l)
-        h = l + np.array([0, 0, 1], dtype=F)
+        to_light = np.asarray(light, dtype=F)
+        to_light = to_light / np.linalg.norm(to_light)
+        ndl = saturate(self.normal @ to_light)
+        h = to_light + np.array([0, 0, 1], dtype=F)
         h = h / np.linalg.norm(h)
         ndh = saturate(self.normal @ h)
         shininess = 2.0 / np.maximum(self.roughness ** 4, 1e-4)

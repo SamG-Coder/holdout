@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(HERE, '..'))
 import numpy as np  # noqa: E402
 
 from lib import bl, preview, tex  # noqa: E402
-from lib.tex import F, saturate  # noqa: E402
+from lib.tex import F  # noqa: E402
 
 TEX = os.path.join(bl.ROOT, 'build', 'tex', 'litter')
 SIZE = 2.0
