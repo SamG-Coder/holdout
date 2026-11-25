@@ -25,8 +25,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -40,7 +38,9 @@ jobs:
     outputs:
       url: ${{ steps.host.outputs.url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - name: Host the scene
         id: host
         env:
@@ -50,20 +50,27 @@ jobs:
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "The level is served from $url" >> "$GITHUB_STEP_SUMMARY"
 
+  # The tests and lints (ci.yml): nothing deploys unless they pass.
+  check:
+    # actionlint does not accept the newer `$/` form; `./` resolves to this repository's ref.
+    uses: ./.github/workflows/ci.yml  # zizmor: ignore[self-repository]
+
   build:
-    needs: scene
+    needs: [scene, check]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Fetch the engine
         run: bash tools/setup-engine.sh
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0  # 1.95.0
         with:
           targets: wasm32-unknown-unknown
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # The web build has a target folder of its own, and installs wasm-bindgen beside it.
           workspaces: ". -> target/web"
@@ -76,16 +83,19 @@ jobs:
           [ -n "$SCENE_URL" ] || { echo "the scene job gave no address for the level" >&2; exit 1; }
           bash tools/build-web.sh --scene-url "$SCENE_URL"
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa  # v3.0.1
         with:
           path: dist
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e  # v4.0.5
